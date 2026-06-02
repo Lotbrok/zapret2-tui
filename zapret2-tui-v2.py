@@ -1,0 +1,1440 @@
+#!/usr/bin/env python3
+"""
+zapret2-tui v2 — консольный интерфейс управления zapret2
+с AI-подбором стратегий обхода DPI.
+
+Требует: Python 3.6+, curses (stdlib)
+Опционально: ANTHROPIC_API_KEY в env — для AI-поиска и генерации стратегий
+"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  IMPORTS
+# ──────────────────────────────────────────────────────────────────────────────
+import curses
+import os, sys, json, shlex, textwrap, re, time, threading, subprocess
+import urllib.request, urllib.parse, urllib.error
+from typing import Optional, List, Dict, Tuple, Callable
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  CONFIG
+# ──────────────────────────────────────────────────────────────────────────────
+
+CONFIG_FILE = os.path.expanduser("~/.zapret2-tui.json")
+
+DEFAULT_CONFIG = {
+    "zapret_dir":   "/opt/zapret2",
+    "binary":       "nfqws2",
+    "lua_lib":      "lua/zapret-lib.lua",
+    "lua_antidpi":  "lua/zapret-antidpi.lua",
+    "qnum":         "200",
+    "profiles":     [],
+    "ai_results":   [],     # найденные AI стратегии
+    "anthropic_key": "",    # опционально, иначе из env
+}
+
+CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
+CLAUDE_MODEL   = "claude-sonnet-4-20250514"
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  STRATEGY TEMPLATES
+# ──────────────────────────────────────────────────────────────────────────────
+
+STRATEGY_TEMPLATES = {
+    "HTTPS TLS (базовый)": {
+        "desc": "fake+multidisorder, MD5 fooling",
+        "filter_tcp": "443", "filter_l7": "tls", "out_range": "-d10",
+        "desync": ["fake:blob=fake_default_tls:tcp_md5:repeats=6",
+                   "multidisorder:pos=midsld"],
+    },
+    "HTTPS TLS (autottl)": {
+        "desc": "fake+fakedsplit с автоматическим TTL",
+        "filter_tcp": "443", "filter_l7": "tls", "out_range": "-d10",
+        "desync": ["fake:blob=fake_default_tls:ip_autottl=-2,3-20:ip6_autottl=-2,3-20:tcp_md5",
+                   "fakedsplit:ip_autottl=-2,3-20:ip6_autottl=-2,3-20:tcp_md5"],
+    },
+    "HTTP (базовый)": {
+        "desc": "fake+fakedsplit для HTTP",
+        "filter_tcp": "80", "filter_l7": "http", "out_range": "-d10",
+        "desync": ["fake:blob=fake_default_http:ip_autottl=-2,3-20:tcp_md5",
+                   "fakedsplit:ip_autottl=-2,3-20:tcp_md5"],
+    },
+    "QUIC / YouTube UDP": {
+        "desc": "QUIC fake repeats",
+        "filter_udp": "443", "filter_l7": "quic",
+        "desync": ["fake:blob=fake_default_quic:repeats=11"],
+    },
+    "YouTube HTTPS (sni=google)": {
+        "desc": "SNI подмена на www.google.com",
+        "filter_tcp": "443", "filter_l7": "tls", "out_range": "-d10",
+        "desync": ["fake:blob=fake_default_tls:tcp_md5:repeats=11:tls_mod=rnd,dupsid,sni=www.google.com",
+                   "multidisorder:pos=1,midsld"],
+    },
+    "wssize + syndata": {
+        "desc": "Уменьшение TCP window size",
+        "filter_tcp": "443", "filter_l7": "tls", "out_range": "-d10",
+        "desync": ["wssize:wsize=1:scale=6", "syndata", "multisplit:pos=midsld"],
+    },
+    "Discord / WireGuard / STUN": {
+        "desc": "UDP обфускация для Discord/WG/STUN",
+        "filter_l7": "wireguard,stun,discord",
+        "desync": ["fake:blob=0x00000000000000000000000000000000:repeats=2"],
+    },
+    "Полный комплект (HTTP+HTTPS+QUIC)": {
+        "desc": "Три протокола одновременно",
+        "multiprofile": True,
+        "profiles": [
+            {"filter_tcp": "80",  "filter_l7": "http",  "out_range": "-d10",
+             "desync": ["fake:blob=fake_default_http:ip_autottl=-2,3-20:tcp_md5",
+                        "fakedsplit:ip_autottl=-2,3-20:tcp_md5"]},
+            {"filter_tcp": "443", "filter_l7": "tls",   "out_range": "-d10",
+             "desync": ["fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000:repeats=6",
+                        "multidisorder:pos=midsld"]},
+            {"filter_udp": "443", "filter_l7": "quic",
+             "desync": ["fake:blob=fake_default_quic:repeats=11"]},
+        ],
+    },
+}
+
+# Матрица встроенных кандидатов для AI-подбора
+BUILTIN_CANDIDATES = [
+    ("443", "tls",  "-d10",  ["fake:blob=fake_default_tls:tcp_md5:repeats=6", "multidisorder:pos=midsld"]),
+    ("443", "tls",  "-d10",  ["fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000:repeats=6", "multidisorder:pos=midsld"]),
+    ("443", "tls",  "-d10",  ["fake:blob=fake_default_tls:tcp_md5:repeats=11:tls_mod=rnd,dupsid,sni=www.google.com", "multidisorder:pos=1,midsld"]),
+    ("443", "tls",  "-d10",  ["fake:blob=fake_default_tls:ip_autottl=-2,3-20:ip6_autottl=-2,3-20:tcp_md5", "fakedsplit:ip_autottl=-2,3-20:ip6_autottl=-2,3-20:tcp_md5"]),
+    ("443", "tls",  "-d10",  ["fake:blob=fake_default_tls:tcp_md5:repeats=6:tls_mod=rnd,rndsni,dupsid", "multisplit:pos=1:seqovl=5"]),
+    ("443", "tls",  "-d10",  ["wssize:wsize=1:scale=6", "syndata", "multisplit:pos=midsld"]),
+    ("443", "tls",  "-d10",  ["fake:blob=fake_default_tls:tcp_flags_unset=ack:tls_mod=rnd,rndsni,dupsid"]),
+    ("443", "tls",  "-d10",  ["fakedsplit:ip_autottl=-1,3-20:tcp_md5"]),
+    ("443", "tls",  "-d10",  ["multisplit:pos=1,midsld"]),
+    ("80,443", "tls,http", "-d10", ["fake:blob=fake_default_tls:tcp_md5", "multidisorder:pos=midsld"]),
+]
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  UTILS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    if os.path.exists(CONFIG_FILE):
+        try:
+            cfg = json.load(open(CONFIG_FILE))
+            for k, v in DEFAULT_CONFIG.items():
+                cfg.setdefault(k, v)
+            return cfg
+        except Exception:
+            pass
+    return dict(DEFAULT_CONFIG)
+
+def save_config(cfg: dict):
+    json.dump(cfg, open(CONFIG_FILE, "w"), indent=2, ensure_ascii=False)
+
+def find_binary(cfg: dict) -> Optional[str]:
+    import shutil
+    for c in [
+        os.path.join(cfg["zapret_dir"], cfg["binary"]),
+        os.path.join(cfg["zapret_dir"], "binaries", cfg["binary"]),
+        cfg["binary"],
+    ]:
+        if os.path.isfile(c):
+            return c
+    return shutil.which(cfg["binary"])
+
+def build_cmdline(cfg: dict, profile: dict, extra: str = "") -> List[str]:
+    binary = find_binary(cfg) or cfg["binary"]
+    zdir   = cfg["zapret_dir"]
+    lib    = os.path.join(zdir, cfg["lua_lib"])
+    adpi   = os.path.join(zdir, cfg["lua_antidpi"])
+    cmd = [binary, f"--qnum={cfg['qnum']}",
+           f"--lua-init=@{lib}", f"--lua-init=@{adpi}"]
+    for li in profile.get("lua_init", []):  cmd.append(f"--lua-init={li}")
+    for b  in profile.get("blobs",    []):  cmd.append(f"--blob={b}")
+
+    def block(p, last):
+        if p.get("filter_tcp"):   cmd.append(f"--filter-tcp={p['filter_tcp']}")
+        if p.get("filter_udp"):   cmd.append(f"--filter-udp={p['filter_udp']}")
+        if p.get("filter_l7"):    cmd.append(f"--filter-l7={p['filter_l7']}")
+        if p.get("hostlist"):
+            hl = p["hostlist"] if os.path.isabs(p["hostlist"]) else os.path.join(zdir, p["hostlist"])
+            cmd.append(f"--hostlist={hl}")
+        if p.get("out_range"):    cmd.append(f"--out-range={p['out_range']}")
+        if p.get("in_range"):     cmd.append(f"--in-range={p['in_range']}")
+        for ds in p.get("desync", []): cmd.append(f"--lua-desync={ds}")
+        if not last: cmd.append("--new")
+
+    if profile.get("multiprofile"):
+        subs = profile["profiles"]
+        for i, p in enumerate(subs): block(p, i == len(subs)-1)
+    else:
+        block(profile, True)
+    if extra: cmd += shlex.split(extra)
+    return cmd
+
+def guess_service(domain: str) -> str:
+    known = {
+        "instagram.com":"Instagram","facebook.com":"Facebook","twitter.com":"Twitter/X",
+        "x.com":"Twitter/X","youtube.com":"YouTube","tiktok.com":"TikTok",
+        "telegram.org":"Telegram","t.me":"Telegram","discord.com":"Discord",
+        "linkedin.com":"LinkedIn","reddit.com":"Reddit","twitch.tv":"Twitch",
+        "spotify.com":"Spotify","netflix.com":"Netflix","whatsapp.com":"WhatsApp",
+    }
+    d = domain.lower().lstrip("www.")
+    return known.get(d, known.get(domain.lower(), domain.split(".")[0].capitalize()))
+
+def normalize_domain(raw: str) -> str:
+    raw = raw.strip()
+    raw = re.sub(r"^https?://", "", raw)
+    return raw.split("/")[0].split("?")[0]
+
+def call_claude_api(cfg: dict, payload: dict) -> Optional[dict]:
+    key = cfg.get("anthropic_key","") or os.environ.get("ANTHROPIC_API_KEY","")
+    if not key:
+        return None
+    try:
+        body = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            CLAUDE_API_URL, data=body, method="POST",
+            headers={"Content-Type":"application/json",
+                     "x-api-key": key,
+                     "anthropic-version":"2023-06-01",
+                     "anthropic-beta":"web-search-2025-03-05"})
+        with urllib.request.urlopen(req, timeout=90) as r:
+            return json.loads(r.read())
+    except Exception:
+        return None
+
+def extract_text(data: dict) -> str:
+    return "".join(b.get("text","") for b in data.get("content",[]) if b.get("type")=="text")
+
+def parse_json_from_text(text: str):
+    text = re.sub(r"```json\s*","", text)
+    text = re.sub(r"```\s*","", text)
+    m = re.search(r"\[.*\]", text, re.DOTALL)
+    if m:
+        return json.loads(m.group())
+    return None
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  CONNECTIVITY CHECK
+# ──────────────────────────────────────────────────────────────────────────────
+
+def check_url(domain: str, timeout=8) -> Tuple[bool,str]:
+    url = f"https://{domain}" if not domain.startswith("http") else domain
+    try:
+        r = subprocess.run(
+            ["curl","-s","-o","/dev/null","-w","%{http_code}",
+             "--max-time",str(timeout),"--connect-timeout","5","-L","--insecure",url],
+            capture_output=True, text=True, timeout=timeout+3)
+        code = r.stdout.strip()
+        ok = code.isdigit() and 200 <= int(code) < 400
+        return ok, f"HTTP {code}"
+    except FileNotFoundError:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent":"curl/7.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return True, f"HTTP {resp.status}"
+        except Exception as e:
+            return False, str(e)
+    except Exception as e:
+        return False, str(e)
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  AI STRATEGY FINDER
+# ──────────────────────────────────────────────────────────────────────────────
+
+class StrategyFinder:
+    def __init__(self, domain, cfg, log_cb, progress_cb, found_cb, done_cb):
+        self.domain   = normalize_domain(domain)
+        self.cfg      = cfg
+        self.log      = log_cb
+        self.progress = progress_cb
+        self.found    = found_cb
+        self.done     = done_cb
+        self._stop    = threading.Event()
+        self._proc: Optional[subprocess.Popen] = None
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._kill()
+
+    def _kill(self):
+        if self._proc and self._proc.poll() is None:
+            try: self._proc.terminate(); self._proc.wait(2)
+            except Exception:
+                try: self._proc.kill()
+                except Exception: pass
+        self._proc = None
+
+    # ── поиск в интернете ────────────────────────────────────────────────────
+    def _search_internet(self) -> List[dict]:
+        svc = guess_service(self.domain)
+        self.log(f"[AI] Ищу решения для {svc} ({self.domain}) в интернете…")
+        prompt = f"""You are an expert on zapret2 anti-DPI software (github.com/bol-van/zapret2).
+
+Search the web for existing working zapret / nfqws / zapret2 bypass configurations for:
+**{self.domain}** ({svc})
+
+Search Russian forums (ntc.party, habr.com, 4pda.to), GitHub issues, gists for any nfqws/zapret configs
+that reportedly work for {svc} especially in Russia.
+
+Return ONLY a JSON array (no markdown, no text before/after) with up to 6 strategy profiles:
+[
+  {{
+    "name": "short name",
+    "source": "URL or 'web-search'",
+    "filter_tcp": "443",
+    "filter_udp": "",
+    "filter_l7": "tls",
+    "out_range": "-d10",
+    "desync": ["lua-desync-arg1", "lua-desync-arg2"],
+    "multiprofile": false,
+    "profiles": []
+  }}
+]
+Only valid zapret2 --lua-desync arguments. Return JSON array ONLY."""
+
+        data = call_claude_api(self.cfg, {
+            "model": CLAUDE_MODEL, "max_tokens": 2000,
+            "tools": [{"type":"web_search_20250305","name":"web_search"}],
+            "messages": [{"role":"user","content":prompt}]
+        })
+        if not data: return []
+        text = extract_text(data)
+        try:
+            result = parse_json_from_text(text)
+            if result:
+                self.log(f"[AI] Найдено {len(result)} вариантов из интернета")
+                return result
+        except Exception: pass
+        return []
+
+    # ── AI генерация новых ───────────────────────────────────────────────────
+    def _generate_new(self, failed: List[dict]) -> List[dict]:
+        self.log("[AI] Генерирую новые стратегии…")
+        failed_json = json.dumps([
+            {"desync": p.get("desync",[]), "mp": p.get("multiprofile",False)}
+            for p in failed[:8]
+        ], ensure_ascii=False)
+        prompt = f"""You are an expert on zapret2 anti-DPI (github.com/bol-van/zapret2).
+
+Trying to bypass DPI for: **{self.domain}** ({guess_service(self.domain)})
+
+Already FAILED strategies (do not repeat):
+{failed_json}
+
+Generate 6 NEW diverse strategies. Try different approaches:
+- oob technique: oob:data=0x00 (sends out-of-band TCP data)
+- multisplit with seqovl: multisplit:pos=2:seqovl=5:seqovl_pattern=0x1603030000
+- datanoack fooling: fake:blob=fake_default_tls:tcp_flags_unset=ack
+- badseq: fakedsplit:pos=method+2:tcp_ack=-66000:tcp_ts_up
+- wssize combination: wssize:wsize=1:scale=6 then syndata
+- ipfrag: send:ipfrag then drop
+- pktmod: pktmod:ip_ttl=1 for incoming packets
+- QUIC+TLS combo multiprofile
+
+Return ONLY JSON array, no text before/after:
+[{{"name":"..","source":"generated","filter_tcp":"443","filter_udp":"","filter_l7":"tls","out_range":"-d10","desync":["arg1"],"multiprofile":false,"profiles":[]}}]"""
+
+        data = call_claude_api(self.cfg, {
+            "model": CLAUDE_MODEL, "max_tokens": 1500,
+            "messages": [{"role":"user","content":prompt}]
+        })
+        if not data: return []
+        try:
+            result = parse_json_from_text(extract_text(data))
+            if result:
+                self.log(f"[AI] Сгенерировано {len(result)} новых вариантов")
+                return result
+        except Exception: pass
+        return []
+
+    # ── тест стратегии ───────────────────────────────────────────────────────
+    def _test(self, profile: dict) -> Tuple[bool, str]:
+        binary = find_binary(self.cfg)
+        if not binary:
+            return False, "бинарник не найден"
+
+        # Временный hostlist только для тестируемого домена
+        hl = f"/tmp/z2test_{int(time.time())}.txt"
+        try:
+            with open(hl,"w") as f: f.write(self.domain + "\n")
+            p2 = dict(profile)
+            p2["hostlist"] = hl
+            cmd = build_cmdline(self.cfg, p2)
+        except Exception as e:
+            return False, str(e)
+
+        self.log(f"[AI]   cmd: {' '.join(cmd[:6])}…")
+        try:
+            self._proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except PermissionError:
+            return False, "нет прав root"
+        except FileNotFoundError:
+            return False, "бинарник недоступен"
+        except Exception as e:
+            return False, str(e)
+
+        time.sleep(2.5)
+        if self._proc.poll() is not None:
+            self._kill()
+            try: os.unlink(hl)
+            except: pass
+            return False, f"процесс упал (код {self._proc.returncode})"
+
+        ok, detail = False, "timeout"
+        for _ in range(3):
+            if self._stop.is_set(): break
+            ok, detail = check_url(self.domain)
+            if ok: break
+            time.sleep(1.5)
+
+        self._kill()
+        try: os.unlink(hl)
+        except: pass
+        return ok, detail
+
+    # ── миксование ──────────────────────────────────────────────────────────
+    def _make_mixes(self, successful: List[dict], candidates: List[dict]) -> List[dict]:
+        pool = successful + candidates[:3]
+        if len(pool) < 2: return []
+        mixes = []
+        # Микс 1: лучший HTTPS + HTTP + QUIC
+        https_p = next((p for p in pool if "443" in str(p.get("filter_tcp",""))), None)
+        if https_p:
+            mixes.append({
+                "name": f"Микс: {https_p.get('name','HTTPS')[:20]} + HTTP + QUIC",
+                "source": "mixed", "multiprofile": True, "profiles": [
+                    {"filter_tcp":"80","filter_l7":"http","out_range":"-d10",
+                     "desync":["fake:blob=fake_default_http:ip_autottl=-2,3-20:tcp_md5","fakedsplit:ip_autottl=-2,3-20:tcp_md5"]},
+                    {"filter_tcp": https_p.get("filter_tcp","443"),
+                     "filter_l7":  https_p.get("filter_l7","tls"),
+                     "out_range":  https_p.get("out_range","-d10"),
+                     "desync":     https_p.get("desync",[])},
+                    {"filter_udp":"443","filter_l7":"quic",
+                     "desync":["fake:blob=fake_default_quic:repeats=11"]},
+                ]
+            })
+        # Микс 2: две HTTPS стратегии как fallback профили
+        https_all = [p for p in pool if "443" in str(p.get("filter_tcp",""))]
+        if len(https_all) >= 2:
+            a, b = https_all[0], https_all[1]
+            mixes.append({
+                "name": f"Микс: {a.get('name','')[:15]} || {b.get('name','')[:15]}",
+                "source": "mixed", "multiprofile": True, "profiles": [
+                    {"filter_tcp":"443","filter_l7":"tls","out_range":"-d10","desync": a.get("desync",[])},
+                    {"filter_tcp":"443","filter_l7":"tls","out_range":"-d10","desync": b.get("desync",[])},
+                ]
+            })
+        return mixes
+
+    # ── главный цикл ─────────────────────────────────────────────────────────
+    def _run(self):
+        domain = self.domain
+        svc = guess_service(domain)
+        self.log(f"[AI] ══════════════════════════════")
+        self.log(f"[AI] Подбор стратегии для: {domain} ({svc})")
+        self.log(f"[AI] ══════════════════════════════")
+
+        # Шаг 0: базовая проверка
+        self.progress("Базовая проверка доступности…", 0, 100)
+        ok, detail = check_url(domain)
+        if ok:
+            self.log(f"[AI] {domain} доступен без zapret ({detail})")
+            self.done(True)
+            return
+        self.log(f"[AI] Без zapret: {detail}")
+
+        successful = []
+
+        # Шаг 1: поиск в интернете (если есть API key)
+        has_key = bool(self.cfg.get("anthropic_key") or os.environ.get("ANTHROPIC_API_KEY"))
+        internet_cands = []
+        if has_key and not self._stop.is_set():
+            self.progress("Поиск решений в интернете через AI…", 5, 100)
+            internet_cands = self._search_internet()
+
+        # Шаг 2: встроенные кандидаты
+        builtin = [{
+            "name": f"builtin-{i+1}: {ds[0][:25]}",
+            "source": "builtin",
+            "filter_tcp": tcp, "filter_udp": "", "filter_l7": l7,
+            "out_range": rng, "desync": list(ds),
+            "multiprofile": False, "profiles": []
+        } for i,(tcp,l7,rng,ds) in enumerate(BUILTIN_CANDIDATES)]
+
+        # Полный мульти-профиль
+        builtin.append({
+            "name": "builtin-full: HTTP+HTTPS+QUIC",
+            "source": "builtin", "multiprofile": True,
+            "profiles": [
+                {"filter_tcp":"80","filter_l7":"http","out_range":"-d10",
+                 "desync":["fake:blob=fake_default_http:ip_autottl=-2,3-20:tcp_md5","fakedsplit:ip_autottl=-2,3-20:tcp_md5"]},
+                {"filter_tcp":"443","filter_l7":"tls","out_range":"-d10",
+                 "desync":["fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000:repeats=6","multidisorder:pos=midsld"]},
+                {"filter_udp":"443","filter_l7":"quic",
+                 "desync":["fake:blob=fake_default_quic:repeats=11"]},
+            ]
+        })
+
+        all_cands = internet_cands + builtin
+        failed = []
+        total = len(all_cands) + 12
+
+        for i, cand in enumerate(all_cands):
+            if self._stop.is_set(): break
+            name = cand.get("name", f"#{i+1}")
+            src  = cand.get("source","?")
+            self.progress(f"[{i+1}/{len(all_cands)}] {src}: {name[:35]}", i+1, total)
+            self.log(f"[AI] Тест [{i+1}]: {name}")
+            ok, detail = self._test(cand)
+            if ok:
+                self.log(f"[AI] ✓ УСПЕХ: {name} ({detail})")
+                cand["name"] = f"{svc}: {cand.get('source','?')}: {cand.get('name','')}"
+                self.found(cand)
+                successful.append(cand)
+                # Сразу строим миксы
+                mixes = self._make_mixes(successful, failed[:3])
+                for m in mixes: self.found(m)
+                self.done(True)
+                return
+            else:
+                self.log(f"[AI] ✗ {name}: {detail}")
+                failed.append(cand)
+
+        # Шаг 3: AI генерирует новые
+        if has_key and not self._stop.is_set():
+            self.progress("AI генерирует новые стратегии…", len(all_cands)+1, total)
+            ai_cands = self._generate_new(failed)
+            for i, cand in enumerate(ai_cands):
+                if self._stop.is_set(): break
+                name = cand.get("name", f"ai-{i+1}")
+                self.progress(f"[AI] Тест: {name[:35]}", len(all_cands)+i+2, total)
+                self.log(f"[AI] AI тест [{i+1}]: {name}")
+                ok, detail = self._test(cand)
+                if ok:
+                    self.log(f"[AI] ✓ УСПЕХ (AI): {name}")
+                    cand["name"] = f"{svc} [AI]: {name}"
+                    self.found(cand)
+                    mixes = self._make_mixes([cand], failed[:3])
+                    for m in mixes: self.found(m)
+                    self.done(True)
+                    return
+                else:
+                    self.log(f"[AI] ✗ AI: {name}: {detail}")
+                    failed.append(cand)
+
+        # Шаг 4: попытка миксов из провалившихся
+        if not self._stop.is_set() and len(failed) >= 2:
+            self.progress("Тестирую комбинированные профили…", total-2, total)
+            mixes = self._make_mixes([], failed[:5])
+            for cand in mixes:
+                if self._stop.is_set(): break
+                name = cand.get("name","mix")
+                self.log(f"[AI] Микс тест: {name}")
+                ok, detail = self._test(cand)
+                if ok:
+                    self.log(f"[AI] ✓ УСПЕХ (Микс): {name}")
+                    cand["name"] = f"{svc} [Микс]"
+                    self.found(cand)
+                    self.done(True)
+                    return
+
+        self.log(f"[AI] Не нашёл рабочей стратегии для {domain}")
+        self.done(False)
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  CURSES COLORS
+# ──────────────────────────────────────────────────────────────────────────────
+
+C_TITLE=1; C_MENU=2; C_SEL=3; C_STATUS=4; C_BORDER=5
+C_KEY=6;   C_WARN=7; C_OK=8;  C_DIM=9;    C_AI=10
+
+def init_colors():
+    curses.start_color(); curses.use_default_colors()
+    curses.init_pair(C_TITLE,  curses.COLOR_BLACK,   curses.COLOR_CYAN)
+    curses.init_pair(C_MENU,   curses.COLOR_WHITE,   -1)
+    curses.init_pair(C_SEL,    curses.COLOR_BLACK,   curses.COLOR_GREEN)
+    curses.init_pair(C_STATUS, curses.COLOR_BLACK,   curses.COLOR_YELLOW)
+    curses.init_pair(C_BORDER, curses.COLOR_CYAN,    -1)
+    curses.init_pair(C_KEY,    curses.COLOR_YELLOW,  -1)
+    curses.init_pair(C_WARN,   curses.COLOR_RED,     -1)
+    curses.init_pair(C_OK,     curses.COLOR_GREEN,   -1)
+    curses.init_pair(C_DIM,    curses.COLOR_WHITE,   -1)
+    curses.init_pair(C_AI,     curses.COLOR_MAGENTA, -1)
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  MAIN TUI CLASS
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ZapretTUI:
+    def __init__(self, scr):
+        self.scr = scr
+        self.cfg = load_config()
+        self.proc: Optional[subprocess.Popen] = None
+        self.log_lines: List[str] = []
+        self.status_msg = ""
+        # AI state
+        self.ai_finder: Optional[StrategyFinder] = None
+        self.ai_progress = ("Ожидание…", 0, 100)
+        self.ai_new_results: List[dict] = []  # потокобезопасная очередь
+        self._ai_lock = threading.Lock()
+        self._ai_done = False
+        self._ai_success = False
+        self._setup()
+        self.main_loop()
+
+    def _setup(self):
+        curses.curs_set(0); self.scr.keypad(True); init_colors()
+
+    # ── Лог ──────────────────────────────────────────────────────────────────
+    def add_log(self, line: str):
+        import datetime
+        ts = datetime.datetime.now().strftime("%H:%M:%S ")
+        self.log_lines.append(ts + line)
+        if len(self.log_lines) > 600:
+            self.log_lines = self.log_lines[-600:]
+
+    # ── Отрисовка утилиты ────────────────────────────────────────────────────
+    def _center(self, win, row, text, attr=0):
+        h, w = win.getmaxyx()
+        x = max(0, (w - len(text)) // 2)
+        try: win.addstr(row, x, text[:w-2], attr)
+        except curses.error: pass
+
+    def border_box(self, win, title=""):
+        win.box()
+        if title:
+            w = win.getmaxyx()[1]
+            t = f" {title} "
+            try: win.addstr(0, max(2,(w-len(t))//2), t,
+                            curses.color_pair(C_BORDER)|curses.A_BOLD)
+            except curses.error: pass
+
+    def draw_title(self):
+        h, w = self.scr.getmaxyx()
+        t = " zapret2-tui v2  [AI стратегии] "
+        try: self.scr.addstr(0, 0, t.center(w),
+                             curses.color_pair(C_TITLE)|curses.A_BOLD)
+        except curses.error: pass
+
+    def draw_statusbar(self):
+        h, w = self.scr.getmaxyx()
+        running = self.proc and self.proc.poll() is None
+        if running:
+            s = f" ▶ ЗАПУЩЕН PID={self.proc.pid}  {self.status_msg}"
+            a = curses.color_pair(C_OK)|curses.A_BOLD
+        elif self.ai_finder and not self._ai_done:
+            msg, cur, tot = self.ai_progress
+            s = f" 🤖 AI: {msg[:50]}  [{cur}/{tot}]"
+            a = curses.color_pair(C_AI)|curses.A_BOLD
+        else:
+            s = f" ■ СТОП  {self.status_msg}"
+            a = curses.color_pair(C_STATUS)
+        try: self.scr.addstr(h-1, 0, s[:w-1].ljust(w-1), a)
+        except curses.error: pass
+
+    # ── Диалоги ──────────────────────────────────────────────────────────────
+    def msgbox(self, msg, title="Сообщение"):
+        h, w = self.scr.getmaxyx()
+        lines = []
+        for ln in msg.split("\n"):
+            lines += textwrap.wrap(ln, w-8) or [""]
+        bh = min(len(lines)+5, h-4); bw = min(max(len(l) for l in lines)+6, w-4)
+        y=(h-bh)//2; x=(w-bw)//2
+        win = curses.newwin(bh, bw, y, x)
+        win.bkgd(' ', curses.color_pair(C_MENU)); self.border_box(win, title)
+        for i, ln in enumerate(lines[:bh-4]):
+            try: win.addstr(i+2, 3, ln[:bw-6])
+            except curses.error: pass
+        try: win.addstr(bh-1, (bw-10)//2, " [ OK ] ", curses.color_pair(C_KEY))
+        except curses.error: pass
+        win.refresh()
+        while win.getch() not in (10,13,27,ord('q')): pass
+        del win; self.scr.touchwin(); self.scr.refresh()
+
+    def inputbox(self, prompt, default="", title="Ввод") -> Optional[str]:
+        h, w = self.scr.getmaxyx()
+        bw = min(max(len(prompt)+8, 55), w-4); bh = 7
+        y=(h-bh)//2; x=(w-bw)//2
+        win = curses.newwin(bh, bw, y, x)
+        win.bkgd(' ', curses.color_pair(C_MENU)); self.border_box(win, title)
+        try: win.addstr(2, 3, prompt[:bw-6])
+        except curses.error: pass
+        ew = curses.newwin(1, bw-6, y+4, x+3)
+        ew.bkgd(' ', curses.color_pair(C_SEL))
+        curses.curs_set(1)
+        buf = list(default); pos = len(buf)
+        while True:
+            ew.clear()
+            disp = "".join(buf)
+            try: ew.addstr(0, 0, disp[:bw-8]); ew.move(0, min(pos, bw-9))
+            except curses.error: pass
+            ew.refresh(); k = win.getch()
+            if k in (10,13):
+                curses.curs_set(0); del ew; del win
+                self.scr.touchwin(); self.scr.refresh()
+                return "".join(buf)
+            elif k==27:
+                curses.curs_set(0); del ew; del win
+                self.scr.touchwin(); self.scr.refresh(); return None
+            elif k in (curses.KEY_BACKSPACE, 127, 8):
+                if pos > 0: buf.pop(pos-1); pos-=1
+            elif k==curses.KEY_DC:
+                if pos < len(buf): buf.pop(pos)
+            elif k==curses.KEY_LEFT:  pos=max(0,pos-1)
+            elif k==curses.KEY_RIGHT: pos=min(len(buf),pos+1)
+            elif 32<=k<256: buf.insert(pos,chr(k)); pos+=1
+
+    def confirm(self, q, title="Подтверждение") -> bool:
+        h, w = self.scr.getmaxyx()
+        lines = textwrap.wrap(q, w-10) or [q]
+        bh = len(lines)+6; bw = min(max(len(l) for l in lines)+8, w-4)
+        y=(h-bh)//2; x=(w-bw)//2
+        win = curses.newwin(bh, bw, y, x)
+        win.bkgd(' ', curses.color_pair(C_MENU)); self.border_box(win, title)
+        for i, ln in enumerate(lines):
+            try: win.addstr(i+2, 3, ln[:bw-6])
+            except curses.error: pass
+        sel = 0
+        while True:
+            for i,(lbl,col) in enumerate([(" ДА ", C_OK),(" НЕТ ", C_WARN)]):
+                a = (curses.color_pair(col)|curses.A_BOLD) if i==sel else curses.color_pair(C_DIM)
+                try: win.addstr(bh-2, 4+i*10, lbl, a)
+                except curses.error: pass
+            win.refresh(); k = win.getch()
+            if k in (curses.KEY_LEFT, curses.KEY_RIGHT, 9): sel=1-sel
+            elif k in (10,13):
+                del win; self.scr.touchwin(); self.scr.refresh(); return sel==0
+            elif k==27:
+                del win; self.scr.touchwin(); self.scr.refresh(); return False
+
+    def menu(self, items, title="", y_off=2, x_off=2, height=None, width=None) -> int:
+        h, w = self.scr.getmaxyx()
+        mw = min((width or max((len(i) for i in items), default=10)+4), w-x_off-2)
+        mh = min((height or len(items)+2), h-y_off-2)
+        win = curses.newwin(mh, mw, y_off, x_off)
+        win.bkgd(' ', curses.color_pair(C_MENU)); self.border_box(win, title)
+        sel=0; scroll=0; vis=mh-2
+        while True:
+            for i in range(vis):
+                idx=i+scroll
+                if idx>=len(items): break
+                lbl = items[idx][:mw-4]
+                a = (curses.color_pair(C_SEL)|curses.A_BOLD) if idx==sel else curses.color_pair(C_MENU)
+                try: win.addstr(i+1, 2, f" {lbl:<{mw-4}} ", a)
+                except curses.error: pass
+            win.refresh(); k=win.getch()
+            if k==curses.KEY_UP:
+                sel=max(0,sel-1)
+                if sel<scroll: scroll=sel
+            elif k==curses.KEY_DOWN:
+                sel=min(len(items)-1,sel+1)
+                if sel>=scroll+vis: scroll=sel-vis+1
+            elif k in (10,13):
+                del win; self.scr.touchwin(); self.scr.refresh(); return sel
+            elif k==27:
+                del win; self.scr.touchwin(); self.scr.refresh(); return -1
+        del win; self.scr.touchwin(); self.scr.refresh(); return -1
+
+    # ── Лог экран ────────────────────────────────────────────────────────────
+    def show_log(self):
+        h, w = self.scr.getmaxyx()
+        bh=h-4; bw=w-4
+        win=curses.newwin(bh,bw,2,2); win.bkgd(' ',curses.color_pair(C_MENU))
+        scroll=max(0,len(self.log_lines)-(bh-2))
+        while True:
+            win.clear(); self.border_box(win,"Лог  (↑↓  PgUp/PgDn  End  q=выход)")
+            vis=bh-2
+            for i in range(vis):
+                idx=scroll+i
+                if idx>=len(self.log_lines): break
+                ln=self.log_lines[idx][:bw-4]
+                if "[AI]" in ln: a=curses.color_pair(C_AI)
+                elif "ОШИБК" in ln.upper() or "ERROR" in ln.upper(): a=curses.color_pair(C_WARN)
+                elif "УСПЕХ" in ln or "✓" in ln: a=curses.color_pair(C_OK)
+                else: a=curses.color_pair(C_DIM)
+                try: win.addstr(i+1,2,ln,a)
+                except curses.error: pass
+            win.refresh(); k=win.getch()
+            if k in (27,ord('q')): break
+            elif k==curses.KEY_UP:    scroll=max(0,scroll-1)
+            elif k==curses.KEY_DOWN:  scroll=min(max(0,len(self.log_lines)-vis),scroll+1)
+            elif k==curses.KEY_PPAGE: scroll=max(0,scroll-vis)
+            elif k==curses.KEY_NPAGE: scroll=min(max(0,len(self.log_lines)-vis),scroll+vis)
+            elif k==curses.KEY_END:   scroll=max(0,len(self.log_lines)-vis)
+            elif k==curses.KEY_HOME:  scroll=0
+        del win; self.scr.touchwin(); self.scr.refresh()
+
+    # ── Запуск/стоп zapret ────────────────────────────────────────────────────
+    def start_zapret(self, profile, debug=False, extra=""):
+        if self.proc and self.proc.poll() is None:
+            self.msgbox("zapret2 уже запущен!\nСначала остановите текущий процесс.","Ошибка"); return
+        cmd = build_cmdline(self.cfg, profile, extra)
+        if debug: cmd.append("--debug")
+        self.add_log("Запуск: " + " ".join(shlex.quote(a) for a in cmd[:8]) + "…")
+        try:
+            self.proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1)
+            self.add_log(f"Запущен PID={self.proc.pid}")
+            self.status_msg = profile.get("name","(без имени)")
+        except PermissionError:
+            self.msgbox("Нет прав root/sudo.","Ошибка")
+        except FileNotFoundError:
+            self.msgbox(f"Бинарник не найден:\n{cmd[0]}","Ошибка")
+        except Exception as e:
+            self.msgbox(str(e),"Ошибка")
+
+    def stop_zapret(self):
+        if not self.proc or self.proc.poll() is not None:
+            self.status_msg=""; return
+        try:
+            self.proc.terminate()
+            try: self.proc.wait(3)
+            except subprocess.TimeoutExpired: self.proc.kill()
+            self.add_log(f"Остановлен PID={self.proc.pid}")
+        except Exception as e:
+            self.add_log(f"Ошибка стопа: {e}")
+        self.proc=None; self.status_msg=""
+
+    def poll_proc(self):
+        if not self.proc: return
+        if self.proc.poll() is not None:
+            try:
+                out,_=self.proc.communicate(timeout=0.05)
+                if out:
+                    for ln in out.splitlines(): self.add_log(ln)
+            except Exception: pass
+            self.add_log(f"Процесс завершился (код {self.proc.returncode})")
+            self.proc=None; return
+        try:
+            import select
+            rdy,_,_=select.select([self.proc.stdout],[],[],0)
+            if rdy:
+                ln=self.proc.stdout.readline()
+                if ln: self.add_log(ln.rstrip())
+        except Exception: pass
+
+    # ── AI результаты (thread-safe) ───────────────────────────────────────────
+    def _ai_found_cb(self, profile: dict):
+        with self._ai_lock:
+            self.ai_new_results.append(profile)
+        self.add_log(f"[AI] ✓ Найдена стратегия: {profile.get('name','?')[:50]}")
+
+    def _ai_progress_cb(self, msg: str, cur: int, tot: int):
+        self.ai_progress = (msg, cur, tot)
+
+    def _ai_done_cb(self, success: bool):
+        self._ai_done = True
+        self._ai_success = success
+        with self._ai_lock:
+            results = list(self.ai_new_results)
+        if results:
+            for p in results:
+                if p not in self.cfg.get("profiles",[]):
+                    self.cfg.setdefault("profiles",[]).append(p)
+            save_config(self.cfg)
+            self.add_log(f"[AI] Сохранено {len(results)} профилей")
+        self.add_log(f"[AI] Подбор завершён: {'УСПЕХ' if success else 'НЕ НАЙДЕНО'}")
+
+    # ── AI подбор стратегии ───────────────────────────────────────────────────
+    def ai_strategy_menu(self):
+        # Проверка API key
+        has_key = bool(self.cfg.get("anthropic_key") or os.environ.get("ANTHROPIC_API_KEY"))
+        if not has_key:
+            key = self.inputbox(
+                "API ключ Anthropic (для web-поиска):\n(пусто = работать без AI, только встроенные)",
+                "", "Anthropic API Key"
+            )
+            if key:
+                self.cfg["anthropic_key"] = key
+                save_config(self.cfg)
+
+        domain_raw = self.inputbox(
+            "Сайт/домен/IP для разблокировки:",
+            "instagram.com", "AI Подбор стратегии"
+        )
+        if not domain_raw:
+            return
+
+        domain = normalize_domain(domain_raw)
+        svc = guess_service(domain)
+
+        # Выбор: только поиск или + запуск тестов
+        h, w = self.scr.getmaxyx()
+        action = self.menu(
+            [f"🤖 Полный подбор: поиск + тест стратегий для {svc}",
+             "🔍 Только поиск решений в интернете (без тестов)",
+             "🎛  Миксовать существующие профили",
+             "← Назад"],
+            "Режим AI подбора", y_off=4, x_off=4, width=min(w-8,65)
+        )
+
+        if action == 3 or action == -1:
+            return
+        elif action == 2:
+            self._mix_profiles_menu()
+            return
+        elif action == 1:
+            self._ai_search_only(domain, svc)
+            return
+
+        # Полный подбор
+        if self.ai_finder and not self._ai_done:
+            if not self.confirm("AI подбор уже запущен. Остановить и начать новый?"):
+                return
+            self.ai_finder.stop()
+
+        self._ai_done = False
+        self._ai_success = False
+        with self._ai_lock:
+            self.ai_new_results.clear()
+
+        self.ai_finder = StrategyFinder(
+            domain, self.cfg,
+            log_cb      = self.add_log,
+            progress_cb = self._ai_progress_cb,
+            found_cb    = self._ai_found_cb,
+            done_cb     = self._ai_done_cb,
+        )
+        self.ai_finder.start()
+        self.add_log(f"[AI] Запущен подбор для {domain}")
+
+        # Показываем экран ожидания
+        self._ai_wait_screen(domain, svc)
+
+    def _ai_wait_screen(self, domain: str, svc: str):
+        """Интерактивный экран прогресса AI подбора."""
+        h, w = self.scr.getmaxyx()
+        while True:
+            self.poll_proc()
+            # Проверяем новые результаты
+            with self._ai_lock:
+                new = list(self.ai_new_results)
+
+            # Рисуем экран
+            self.scr.clear()
+            self.draw_title()
+            bh=h-4; bw=w-4
+            win=curses.newwin(bh,bw,2,2); win.bkgd(' ',curses.color_pair(C_MENU))
+            self.border_box(win, f"AI Подбор: {svc} ({domain})")
+
+            # Статус
+            msg, cur, tot = self.ai_progress
+            pct = int(cur*100/tot) if tot>0 else 0
+            bar_w = bw-20
+            filled = int(bar_w * pct / 100)
+            bar = "█"*filled + "░"*(bar_w-filled)
+            try:
+                win.addstr(2, 3, f"Прогресс: {pct:3d}%  ", curses.color_pair(C_KEY)|curses.A_BOLD)
+                win.addstr(2, 18, f"[{bar}]", curses.color_pair(C_AI))
+                win.addstr(3, 3, msg[:bw-6], curses.color_pair(C_DIM))
+            except curses.error: pass
+
+            # Найденные стратегии
+            try: win.addstr(5, 3, "Найденные стратегии:", curses.color_pair(C_KEY)|curses.A_BOLD)
+            except curses.error: pass
+            if new:
+                for i, p in enumerate(new[:bh-14]):
+                    name = p.get("name","?")[:bw-10]
+                    src  = p.get("source","?")
+                    icon = "⭐" if "mixed" not in src else "🔀"
+                    try: win.addstr(6+i, 3, f"{icon} {name}", curses.color_pair(C_OK))
+                    except curses.error: pass
+            else:
+                try: win.addstr(6, 3, "  (поиск идёт…)", curses.color_pair(C_DIM))
+                except curses.error: pass
+
+            # Последние строки лога
+            log_row = max(8, 6+len(new)+2)
+            try: win.addstr(log_row, 3, "Лог:", curses.color_pair(C_KEY))
+            except curses.error: pass
+            log_vis = bh - log_row - 4
+            for i, ln in enumerate(self.log_lines[-log_vis:]):
+                if log_row+1+i >= bh-2: break
+                if "[AI]" in ln: a=curses.color_pair(C_AI)
+                elif "✓" in ln:  a=curses.color_pair(C_OK)
+                elif "✗" in ln:  a=curses.color_pair(C_WARN)
+                else:            a=curses.color_pair(C_DIM)
+                try: win.addstr(log_row+1+i, 3, ln[:bw-6], a)
+                except curses.error: pass
+
+            # Кнопки
+            try:
+                win.addstr(bh-2, 3,
+                           " S Стоп AI  L Лог  Enter Применить найденное  Esc Назад ",
+                           curses.color_pair(C_KEY))
+            except curses.error: pass
+
+            if self._ai_done:
+                if self._ai_success and new:
+                    try: win.addstr(bh-3, 3, f"✓ УСПЕХ! Найдено {len(new)} стратегий. Enter = применить",
+                                    curses.color_pair(C_OK)|curses.A_BOLD)
+                    except curses.error: pass
+                else:
+                    try: win.addstr(bh-3, 3, "✗ Рабочая стратегия не найдена. Esc = назад",
+                                    curses.color_pair(C_WARN)|curses.A_BOLD)
+                    except curses.error: pass
+
+            win.refresh()
+            self.draw_statusbar()
+            self.scr.refresh()
+
+            self.scr.timeout(400)
+            k = self.scr.getch()
+
+            if k in (27, ord('q')) and self._ai_done:
+                del win; self.scr.touchwin(); self.scr.refresh(); return
+            elif k == 27 and not self._ai_done:
+                if self.confirm("AI подбор ещё идёт. Остановить?"):
+                    self.ai_finder.stop()
+                    del win; self.scr.touchwin(); self.scr.refresh(); return
+            elif k in (10, 13) and new:
+                del win; self.scr.touchwin(); self.scr.refresh()
+                self._apply_ai_results(new)
+                return
+            elif k in (ord('s'), ord('S')):
+                if self.ai_finder and not self._ai_done:
+                    self.ai_finder.stop(); self._ai_done=True
+            elif k in (ord('l'), ord('L')):
+                del win; self.scr.touchwin(); self.scr.refresh()
+                self.show_log(); return
+            del win
+
+    def _apply_ai_results(self, results: List[dict]):
+        """Предлагает применить/запустить найденные AI стратегии."""
+        if not results:
+            self.msgbox("Нет результатов для применения."); return
+
+        items = [f"{'🔀' if p.get('source')=='mixed' else '⭐'} {p.get('name','?')[:55]}"
+                 for p in results]
+        items += ["← Назад"]
+        h, w = self.scr.getmaxyx()
+        idx = self.menu(items, "Выберите стратегию",
+                        y_off=3, x_off=3,
+                        height=min(len(items)+2, h-6),
+                        width=min(w-6, 68))
+        if idx < 0 or idx == len(results):
+            return
+
+        profile = results[idx]
+        actions = ["▶ Запустить сейчас",
+                   "▶ Запустить с --debug",
+                   "💾 Сохранить в профили",
+                   "🎛  Смешать с другим профилем",
+                   "← Назад"]
+        act = self.menu(actions, profile.get("name","?")[:40], y_off=5, x_off=5)
+        if act == 0:
+            self.start_zapret(profile)
+        elif act == 1:
+            self.start_zapret(profile, debug=True)
+        elif act == 2:
+            if profile not in self.cfg["profiles"]:
+                self.cfg["profiles"].append(profile)
+                save_config(self.cfg)
+                self.add_log(f"Сохранён: {profile.get('name')}")
+                self.msgbox(f"Профиль сохранён:\n{profile.get('name','')}", "Сохранено")
+        elif act == 3:
+            self._mix_with_other(profile)
+
+    def _ai_search_only(self, domain: str, svc: str):
+        """Только поиск без тестирования."""
+        has_key = bool(self.cfg.get("anthropic_key") or os.environ.get("ANTHROPIC_API_KEY"))
+        if not has_key:
+            self.msgbox("Для поиска нужен Anthropic API ключ.\nНастройки → API ключ", "Нет ключа")
+            return
+
+        self.add_log(f"[AI] Поиск решений для {domain}…")
+        results = []
+        done = threading.Event()
+
+        def _search():
+            finder = StrategyFinder(domain, self.cfg,
+                                    self.add_log, lambda *a: None,
+                                    lambda p: results.append(p), lambda s: done.set())
+            candidates = finder._search_internet()
+            for c in candidates:
+                c["name"] = f"{svc} [web]: {c.get('name','?')}"
+                results.append(c)
+            done.set()
+
+        t = threading.Thread(target=_search, daemon=True)
+        t.start()
+
+        # Ждём с прогресс-спиннером
+        h, w = self.scr.getmaxyx()
+        spinner = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
+        si = 0
+        while not done.is_set():
+            self.scr.clear(); self.draw_title()
+            self.scr.addstr(h//2, w//2-20,
+                            f" {spinner[si%10]} Ищу в интернете для {domain}… ",
+                            curses.color_pair(C_AI)|curses.A_BOLD)
+            self.scr.refresh(); time.sleep(0.15); si+=1
+
+        if results:
+            self._apply_ai_results(results)
+        else:
+            self.msgbox(f"Готовых решений для {domain} не найдено.\nПопробуйте полный подбор.", "Результат")
+
+    # ── Миксование профилей ───────────────────────────────────────────────────
+    def _mix_profiles_menu(self):
+        all_p = self.cfg.get("profiles", [])
+        templates = [{**v, "name": k} for k, v in STRATEGY_TEMPLATES.items()]
+        pool = all_p + templates
+
+        if len(pool) < 2:
+            self.msgbox("Нужно минимум 2 профиля для смешивания."); return
+
+        h, w = self.scr.getmaxyx()
+        items = [p.get("name","?")[:55] for p in pool]
+        self.msgbox("Выберите первый профиль для микса:", "Микс")
+        idx_a = self.menu(items, "Первый профиль",
+                          y_off=3, x_off=3,
+                          height=min(len(items)+2,h-6), width=min(w-6,62))
+        if idx_a < 0: return
+        self.msgbox("Выберите второй профиль:", "Микс")
+        idx_b = self.menu(items, "Второй профиль",
+                          y_off=3, x_off=3,
+                          height=min(len(items)+2,h-6), width=min(w-6,62))
+        if idx_b < 0 or idx_b == idx_a: return
+
+        a, b = pool[idx_a], pool[idx_b]
+        self._mix_with_other(a, b)
+
+    def _mix_with_other(self, profile_a: dict, profile_b: dict = None):
+        if profile_b is None:
+            all_p = self.cfg.get("profiles",[])
+            templates = [{**v,"name":k} for k,v in STRATEGY_TEMPLATES.items()]
+            pool = [p for p in all_p+templates if p is not profile_a]
+            if not pool: self.msgbox("Нет других профилей для микса."); return
+            h,w=self.scr.getmaxyx()
+            idx=self.menu([p.get("name","?")[:55] for p in pool],"Второй профиль",
+                          y_off=3,x_off=3,height=min(len(pool)+2,h-6),width=min(w-6,62))
+            if idx<0: return
+            profile_b = pool[idx]
+
+        # Создаём мульти-профиль
+        def _to_subprofile(p):
+            if p.get("multiprofile"):
+                return p.get("profiles",[])
+            return [{
+                "filter_tcp": p.get("filter_tcp",""),
+                "filter_udp": p.get("filter_udp",""),
+                "filter_l7":  p.get("filter_l7",""),
+                "out_range":  p.get("out_range",""),
+                "desync":     p.get("desync",[]),
+            }]
+
+        subs_a = _to_subprofile(profile_a)
+        subs_b = _to_subprofile(profile_b)
+        name = f"Микс: {profile_a.get('name','A')[:20]} + {profile_b.get('name','B')[:20]}"
+        mixed = {
+            "name": name,
+            "source": "mixed",
+            "multiprofile": True,
+            "profiles": subs_a + subs_b,
+        }
+        # Показываем предпросмотр
+        cmd = build_cmdline(self.cfg, mixed)
+        preview = " ".join(shlex.quote(a) for a in cmd[:10]) + "…"
+        if self.confirm(f"Создать смешанный профиль:\n{name}\n\nКоманда: {preview[:80]}"):
+            self.cfg.setdefault("profiles",[]).append(mixed)
+            save_config(self.cfg)
+            self.add_log(f"Создан микс: {name}")
+            actions = ["▶ Запустить сейчас", "💾 Только сохранить", "← Отмена"]
+            act = self.menu(actions, "Готово!", y_off=5, x_off=5)
+            if act==0: self.start_zapret(mixed)
+
+    # ── Профили ───────────────────────────────────────────────────────────────
+    def profiles_menu(self):
+        while True:
+            profiles = self.cfg.get("profiles",[])
+            items = []
+            for p in profiles:
+                mp = "⊞" if p.get("multiprofile") else " "
+                src = p.get("source","")
+                icon = "🤖" if "ai" in src.lower() or "web" in src.lower() else ("🔀" if "mixed" in src else "▸")
+                items.append(f"{icon}{mp} {p.get('name','?')[:50]}")
+            items += ["  + Новый профиль", "← Назад"]
+            h,w=self.scr.getmaxyx()
+            idx=self.menu(items,"Профили",y_off=2,x_off=2,
+                          height=min(len(items)+2,h-4),width=min(w-4,70))
+            if idx==-1 or idx==len(items)-1: break
+            elif idx==len(items)-2:
+                p=self._edit_profile()
+                if p: self.cfg["profiles"].append(p); save_config(self.cfg)
+            elif idx<len(profiles):
+                p=profiles[idx]
+                acts=["▶ Запустить","▶ Запустить с --debug",
+                      "✏  Редактировать","🔀 Смешать с другим",
+                      "⧉  Дублировать","✗  Удалить","← Назад"]
+                act=self.menu(acts,p.get("name","")[:40],y_off=4,x_off=4)
+                if act==0: self.start_zapret(p)
+                elif act==1: self.start_zapret(p,debug=True)
+                elif act==2:
+                    ep=self._edit_profile(p)
+                    if ep: self.cfg["profiles"][idx]=ep; save_config(self.cfg)
+                elif act==3: self._mix_with_other(p)
+                elif act==4:
+                    import copy; dup=copy.deepcopy(p); dup["name"]+=" (копия)"
+                    self.cfg["profiles"].append(dup); save_config(self.cfg)
+                elif act==5:
+                    if self.confirm(f"Удалить '{p.get('name')}'?"):
+                        self.cfg["profiles"].pop(idx); save_config(self.cfg)
+
+    def _edit_profile(self, profile=None) -> Optional[dict]:
+        import copy
+        if profile is None:
+            profile={"name":"Новый профиль","filter_tcp":"443","filter_udp":"",
+                     "filter_l7":"tls","hostlist":"","out_range":"-d10",
+                     "desync":["fake:blob=fake_default_tls:tcp_md5","multidisorder:pos=midsld"]}
+        else:
+            profile=copy.deepcopy(profile)
+
+        fields=[("name","Имя профиля"),("filter_tcp","TCP порты"),
+                ("filter_udp","UDP порты"),("filter_l7","Протокол L7"),
+                ("hostlist","Hostlist файл"),("out_range","Out range"),("in_range","In range")]
+        while True:
+            self.scr.clear(); self.draw_title()
+            h,w=self.scr.getmaxyx()
+            bh=len(fields)+12; bw=min(72,w-4)
+            y=(h-bh)//2; x=(w-bw)//2
+            win=curses.newwin(bh,bw,y,x)
+            win.bkgd(' ',curses.color_pair(C_MENU)); self.border_box(win,"Редактор профиля")
+            for i,(k,lbl) in enumerate(fields):
+                val=str(profile.get(k,""))
+                try:
+                    win.addstr(i+2,2,f"{lbl}:",curses.color_pair(C_KEY))
+                    win.addstr(i+2,26,val[:bw-28],curses.color_pair(C_DIM))
+                except curses.error: pass
+            ds_row=len(fields)+3
+            try: win.addstr(ds_row,2,"Стратегии (--lua-desync):",curses.color_pair(C_KEY)|curses.A_BOLD)
+            except curses.error: pass
+            for i,ds in enumerate(profile.get("desync",[])[:4]):
+                try: win.addstr(ds_row+1+i,4,f"[{i+1}] {ds[:bw-8]}",curses.color_pair(C_DIM))
+                except curses.error: pass
+            try: win.addstr(bh-2,2,"e=редактировать поле  d=стратегии  s=сохранить  Esc=отмена",
+                            curses.color_pair(C_KEY))
+            except curses.error: pass
+            win.refresh()
+            k=win.getch()
+            if k==27: del win; self.scr.touchwin(); self.scr.refresh(); return None
+            elif k in (ord('s'),ord('S')): del win; self.scr.touchwin(); self.scr.refresh(); return profile
+            elif k in (ord('e'),ord('E')):
+                items=[f"{lbl}: {profile.get(key,'')}" for key,lbl in fields]
+                del win; self.scr.touchwin(); self.scr.refresh()
+                fi=self.menu(items,"Поле",y_off=y+2,x_off=x+2,width=bw-4)
+                if fi>=0:
+                    key,lbl=fields[fi]
+                    val=self.inputbox(lbl,str(profile.get(key,"")),lbl)
+                    if val is not None: profile[key]=val
+            elif k in (ord('d'),ord('D')):
+                del win; self.scr.touchwin(); self.scr.refresh()
+                profile["desync"]=self._edit_desync(profile.get("desync",[]))
+            try: del win
+            except NameError: pass
+
+    def _edit_desync(self, lst: List[str]) -> List[str]:
+        lst=list(lst)
+        while True:
+            items=[f"[{i+1}] {d}" for i,d in enumerate(lst)]
+            items+=["  + Добавить","  ✓ Готово"]
+            h,w=self.scr.getmaxyx()
+            idx=self.menu(items,"lua-desync стратегии",y_off=4,x_off=4,
+                          height=min(len(items)+2,h-8),width=min(w-8,72))
+            if idx==-1 or idx==len(items)-1: break
+            elif idx==len(items)-2:
+                v=self.inputbox("Аргумент lua-desync:","fake:blob=fake_default_tls:tcp_md5")
+                if v: lst.append(v)
+            elif idx<len(lst):
+                acts=["Редактировать","Удалить","↑ Вверх","↓ Вниз"]
+                act=self.menu(acts,lst[idx][:30],y_off=6,x_off=6)
+                if act==0:
+                    v=self.inputbox("Аргумент:",lst[idx])
+                    if v is not None: lst[idx]=v
+                elif act==1:
+                    if self.confirm(f"Удалить?\n{lst[idx]}"): lst.pop(idx)
+                elif act==2 and idx>0: lst[idx],lst[idx-1]=lst[idx-1],lst[idx]
+                elif act==3 and idx<len(lst)-1: lst[idx],lst[idx+1]=lst[idx+1],lst[idx]
+        return lst
+
+    # ── Настройки ─────────────────────────────────────────────────────────────
+    def settings_menu(self):
+        fields=[("zapret_dir","Директория zapret2"),("binary","Бинарник nfqws2/winws2"),
+                ("lua_lib","zapret-lib.lua путь"),("lua_antidpi","zapret-antidpi.lua путь"),
+                ("qnum","Номер NFQUEUE"),("anthropic_key","Anthropic API Key")]
+        while True:
+            items=[f"{lbl:<28} {str(self.cfg.get(k,''))[:30]}" for k,lbl in fields]
+            items+=["  Проверить бинарник","← Назад"]
+            h,w=self.scr.getmaxyx()
+            idx=self.menu(items,"Настройки",y_off=2,x_off=2,
+                          height=min(len(items)+2,h-4),width=min(w-4,66))
+            if idx==-1 or idx==len(items)-1: save_config(self.cfg); break
+            elif idx==len(items)-2:
+                b=find_binary(self.cfg)
+                self.msgbox(f"Бинарник: {b or 'НЕ НАЙДЕН'}","Проверка")
+            elif idx<len(fields):
+                k,lbl=fields[idx]
+                # API key — маскируем при вводе
+                cur=str(self.cfg.get(k,""))
+                if k=="anthropic_key" and cur:
+                    cur="***скрыт***"
+                v=self.inputbox(lbl,cur,lbl)
+                if v is not None and v!="***скрыт***":
+                    self.cfg[k]=v; save_config(self.cfg)
+
+    # ── Быстрый старт ─────────────────────────────────────────────────────────
+    def quick_start(self):
+        names=list(STRATEGY_TEMPLATES.keys())
+        h,w=self.scr.getmaxyx()
+        idx=self.menu(names,"Шаблон стратегии",y_off=3,x_off=3,
+                      height=min(len(names)+2,h-6),width=min(w-6,62))
+        if idx<0: return
+        name=names[idx]; tmpl=STRATEGY_TEMPLATES[name]
+        profile=dict(tmpl); profile["name"]=name
+        debug=self.confirm(f"Запустить с --debug?\n{tmpl.get('desc','')}","Быстрый старт")
+        self.start_zapret(profile,debug=debug)
+
+    def preview_cmd(self):
+        all_p=(self.cfg.get("profiles",[]) +
+               [{**v,"name":k} for k,v in STRATEGY_TEMPLATES.items()])
+        if not all_p: self.msgbox("Нет профилей."); return
+        h,w=self.scr.getmaxyx()
+        idx=self.menu([p.get("name","?")[:55] for p in all_p],"Предпросмотр команды",
+                      y_off=2,x_off=2,height=min(len(all_p)+2,h-4),width=min(w-4,62))
+        if idx<0: return
+        cmd=build_cmdline(self.cfg,all_p[idx])
+        self.msgbox(" ".join(shlex.quote(a) for a in cmd),"Команда запуска")
+
+    def run_blockcheck(self):
+        script=os.path.join(self.cfg["zapret_dir"],"blockcheck2.sh")
+        if not os.path.isfile(script):
+            self.msgbox(f"blockcheck2.sh не найден:\n{script}","Ошибка"); return
+        url=self.inputbox("URL для проверки:","https://example.com","blockcheck2")
+        if not url: return
+        curses.endwin()
+        try: subprocess.run(["bash",script,url])
+        except Exception: pass
+        finally: curses.doupdate(); self.scr.touchwin(); self.scr.refresh()
+
+    # ── Главный экран ─────────────────────────────────────────────────────────
+    def draw_main(self):
+        self.scr.clear(); h,w=self.scr.getmaxyx()
+        self.draw_title()
+        pw=min(34,w//3); ph=h-3
+
+        mw=curses.newwin(ph,pw,1,0); mw.bkgd(' ',curses.color_pair(C_MENU))
+        self.border_box(mw,"Меню")
+        items=[("1","Быстрый старт"),("2","Мои профили"),
+               ("3","🤖 AI подбор стратегии"),("4","🔀 Смешать профили"),
+               ("5","Предпросмотр команды"),("6","Настройки"),
+               ("7","blockcheck2"),("L","Лог"),("S","Стоп"),("Q","Выход")]
+        for i,(k,lbl) in enumerate(items):
+            try:
+                mw.addstr(i+2,2,f" {k} ",curses.color_pair(C_KEY)|curses.A_BOLD)
+                mw.addstr(i+2,6,lbl,curses.color_pair(C_MENU))
+            except curses.error: pass
+        mw.refresh()
+
+        iw_x=pw+1; iw_w=w-pw-1
+        iw=curses.newwin(ph,iw_w,1,iw_x); iw.bkgd(' ',curses.color_pair(C_MENU))
+        self.border_box(iw,"Статус")
+
+        running=self.proc and self.proc.poll() is None
+        stxt="▶ ЗАПУЩЕН" if running else "■ СТОП"
+        sa=(curses.color_pair(C_OK)|curses.A_BOLD) if running else curses.color_pair(C_WARN)
+        try:
+            iw.addstr(2,3,"Статус: ",curses.color_pair(C_KEY))
+            iw.addstr(2,11,stxt,sa)
+            if running: iw.addstr(2,11+len(stxt)+1,f"PID={self.proc.pid}",curses.color_pair(C_DIM))
+        except curses.error: pass
+
+        # AI статус
+        if self.ai_finder and not self._ai_done:
+            msg,cur,tot=self.ai_progress
+            try:
+                iw.addstr(3,3,"🤖 AI: ",curses.color_pair(C_AI)|curses.A_BOLD)
+                iw.addstr(3,10,f"{msg[:iw_w-12]}",curses.color_pair(C_AI))
+            except curses.error: pass
+
+        b=find_binary(self.cfg)
+        try:
+            iw.addstr(5,3,"Бинарник:",curses.color_pair(C_KEY))
+            iw.addstr(5,13,(b or "НЕ НАЙДЕН")[:iw_w-15],
+                      curses.color_pair(C_OK) if b else curses.color_pair(C_WARN))
+            iw.addstr(7,3,"Директория:",curses.color_pair(C_KEY))
+            iw.addstr(7,15,self.cfg["zapret_dir"][:iw_w-17],curses.color_pair(C_DIM))
+            iw.addstr(9,3,"Профилей:",curses.color_pair(C_KEY))
+            iw.addstr(9,13,str(len(self.cfg.get("profiles",[]))),curses.color_pair(C_DIM))
+        except curses.error: pass
+
+        # Лог превью
+        try: iw.addstr(11,3,"Последний лог:",curses.color_pair(C_KEY))
+        except curses.error: pass
+        for i,ln in enumerate(self.log_lines[-(ph-14):]):
+            if 12+i>=ph-1: break
+            if "[AI]" in ln: a=curses.color_pair(C_AI)
+            elif "✓" in ln:  a=curses.color_pair(C_OK)
+            elif "✗" in ln or "ОШИБК" in ln.upper(): a=curses.color_pair(C_WARN)
+            else: a=curses.color_pair(C_DIM)
+            try: iw.addstr(12+i,3,ln[:iw_w-5],a)
+            except curses.error: pass
+        iw.refresh()
+        self.draw_statusbar()
+
+    # ── Главный цикл ─────────────────────────────────────────────────────────
+    def main_loop(self):
+        while True:
+            self.poll_proc()
+            # Проверяем новые AI результаты и сохраняем
+            with self._ai_lock:
+                if self.ai_new_results:
+                    for p in self.ai_new_results:
+                        if p not in self.cfg.get("profiles",[]):
+                            self.cfg.setdefault("profiles",[]).append(p)
+                    save_config(self.cfg)
+
+            self.draw_main()
+            self.scr.timeout(300)
+            k=self.scr.getch()
+
+            if k in (ord('q'),ord('Q')):
+                if self.proc and self.proc.poll() is None:
+                    if self.confirm("zapret2 запущен. Остановить перед выходом?"):
+                        self.stop_zapret()
+                if self.ai_finder and not self._ai_done:
+                    if self.confirm("AI подбор идёт. Остановить?"):
+                        self.ai_finder.stop()
+                break
+            elif k==ord('1'): self.quick_start()
+            elif k==ord('2'): self.profiles_menu()
+            elif k==ord('3'): self.ai_strategy_menu()
+            elif k==ord('4'): self._mix_profiles_menu()
+            elif k==ord('5'): self.preview_cmd()
+            elif k==ord('6'): self.settings_menu()
+            elif k==ord('7'): self.run_blockcheck()
+            elif k in (ord('l'),ord('L')): self.show_log()
+            elif k in (ord('s'),ord('S')):
+                if self.proc and self.proc.poll() is None:
+                    if self.confirm("Остановить zapret2?"): self.stop_zapret()
+                else: self.status_msg="Процесс не запущен"
+
+        self.stop_zapret()
+        if self.ai_finder and not self._ai_done:
+            self.ai_finder.stop()
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+def main():
+    def run(scr): ZapretTUI(scr)
+    try: curses.wrapper(run)
+    except KeyboardInterrupt: pass
+    print("\nzapret2-tui завершён.")
+
+if __name__ == "__main__":
+    main()
