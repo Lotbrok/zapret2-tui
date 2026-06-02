@@ -13,7 +13,7 @@
 ## Установка
 
 ```bash
-git clone https://github.com/ТВО_ИМЯ/zapret2-tui.git
+git clone https://github.com/Lotbrok/zapret2-tui.git
 cd zapret2-tui
 ```
 
