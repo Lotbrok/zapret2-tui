@@ -4,7 +4,8 @@ zapret2-tui v2 — консольный интерфейс управления 
 с AI-подбором стратегий обхода DPI.
 
 Требует: Python 3.6+, curses (stdlib)
-Опционально: ANTHROPIC_API_KEY в env — для AI-поиска и генерации стратегий
+Ключи API хранятся в файле .env (никогда не в коде и не на GitHub).
+Поддерживаемые AI провайдеры: Claude (Anthropic), ChatGPT (OpenAI).
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -15,6 +16,15 @@ import os, sys, json, shlex, textwrap, re, time, threading, subprocess
 import urllib.request, urllib.parse, urllib.error
 from typing import Optional, List, Dict, Tuple, Callable
 
+# Модули проекта
+from zapret2_config import (
+    load_env_file, load_user_config, save_user_config,
+    get_api_key, get_model, get_active_provider,
+    save_api_key_to_env, save_provider_to_env,
+    mask_key, check_env_safety, AI_PROVIDERS, ENV_FILE,
+)
+from zapret2_ai import StrategyFinder, test_api_key, guess_service, normalize_domain
+
 # ──────────────────────────────────────────────────────────────────────────────
 #  CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
@@ -22,18 +32,16 @@ from typing import Optional, List, Dict, Tuple, Callable
 CONFIG_FILE = os.path.expanduser("~/.zapret2-tui.json")
 
 DEFAULT_CONFIG = {
-    "zapret_dir":   "/opt/zapret2",
-    "binary":       "nfqws2",
-    "lua_lib":      "lua/zapret-lib.lua",
-    "lua_antidpi":  "lua/zapret-antidpi.lua",
-    "qnum":         "200",
-    "profiles":     [],
-    "ai_results":   [],     # найденные AI стратегии
-    "anthropic_key": "",    # опционально, иначе из env
+    "zapret_dir":  "/opt/zapret2",
+    "binary":      "nfqws2",
+    "lua_lib":     "lua/zapret-lib.lua",
+    "lua_antidpi": "lua/zapret-antidpi.lua",
+    "qnum":        "200",
+    "profiles":    [],
+    "ai_results":  [],
+    "ai_provider": "",   # claude | openai | "" (автовыбор из .env)
+    # КЛЮЧИ НЕ ХРАНЯТСЯ ЗДЕСЬ — только в .env файле
 }
-
-CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
-CLAUDE_MODEL   = "claude-sonnet-4-20250514"
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  STRATEGY TEMPLATES
@@ -125,7 +133,10 @@ def load_config() -> dict:
     return dict(DEFAULT_CONFIG)
 
 def save_config(cfg: dict):
-    json.dump(cfg, open(CONFIG_FILE, "w"), indent=2, ensure_ascii=False)
+    # Никогда не сохраняем ключи в конфиг — только в .env
+    safe = {k: v for k, v in cfg.items()
+            if k not in ("anthropic_key", "openai_key")}
+    json.dump(safe, open(CONFIG_FILE, "w"), indent=2, ensure_ascii=False)
 
 def find_binary(cfg: dict) -> Optional[str]:
     import shutil
@@ -168,52 +179,8 @@ def build_cmdline(cfg: dict, profile: dict, extra: str = "") -> List[str]:
     if extra: cmd += shlex.split(extra)
     return cmd
 
-def guess_service(domain: str) -> str:
-    known = {
-        "instagram.com":"Instagram","facebook.com":"Facebook","twitter.com":"Twitter/X",
-        "x.com":"Twitter/X","youtube.com":"YouTube","tiktok.com":"TikTok",
-        "telegram.org":"Telegram","t.me":"Telegram","discord.com":"Discord",
-        "linkedin.com":"LinkedIn","reddit.com":"Reddit","twitch.tv":"Twitch",
-        "spotify.com":"Spotify","netflix.com":"Netflix","whatsapp.com":"WhatsApp",
-    }
-    d = domain.lower().lstrip("www.")
-    return known.get(d, known.get(domain.lower(), domain.split(".")[0].capitalize()))
-
-def normalize_domain(raw: str) -> str:
-    raw = raw.strip()
-    raw = re.sub(r"^https?://", "", raw)
-    return raw.split("/")[0].split("?")[0]
-
-def call_claude_api(cfg: dict, payload: dict) -> Optional[dict]:
-    key = cfg.get("anthropic_key","") or os.environ.get("ANTHROPIC_API_KEY","")
-    if not key:
-        return None
-    try:
-        body = json.dumps(payload).encode()
-        req = urllib.request.Request(
-            CLAUDE_API_URL, data=body, method="POST",
-            headers={"Content-Type":"application/json",
-                     "x-api-key": key,
-                     "anthropic-version":"2023-06-01",
-                     "anthropic-beta":"web-search-2025-03-05"})
-        with urllib.request.urlopen(req, timeout=90) as r:
-            return json.loads(r.read())
-    except Exception:
-        return None
-
-def extract_text(data: dict) -> str:
-    return "".join(b.get("text","") for b in data.get("content",[]) if b.get("type")=="text")
-
-def parse_json_from_text(text: str):
-    text = re.sub(r"```json\s*","", text)
-    text = re.sub(r"```\s*","", text)
-    m = re.search(r"\[.*\]", text, re.DOTALL)
-    if m:
-        return json.loads(m.group())
-    return None
-
 # ──────────────────────────────────────────────────────────────────────────────
-#  CONNECTIVITY CHECK
+#  CONNECTIVITY CHECK (используется в TUI для быстрой проверки)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def check_url(domain: str, timeout=8) -> Tuple[bool,str]:
@@ -235,316 +202,6 @@ def check_url(domain: str, timeout=8) -> Tuple[bool,str]:
             return False, str(e)
     except Exception as e:
         return False, str(e)
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  AI STRATEGY FINDER
-# ──────────────────────────────────────────────────────────────────────────────
-
-class StrategyFinder:
-    def __init__(self, domain, cfg, log_cb, progress_cb, found_cb, done_cb):
-        self.domain   = normalize_domain(domain)
-        self.cfg      = cfg
-        self.log      = log_cb
-        self.progress = progress_cb
-        self.found    = found_cb
-        self.done     = done_cb
-        self._stop    = threading.Event()
-        self._proc: Optional[subprocess.Popen] = None
-        self._thread: Optional[threading.Thread] = None
-
-    def start(self):
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._stop.set()
-        self._kill()
-
-    def _kill(self):
-        if self._proc and self._proc.poll() is None:
-            try: self._proc.terminate(); self._proc.wait(2)
-            except Exception:
-                try: self._proc.kill()
-                except Exception: pass
-        self._proc = None
-
-    # ── поиск в интернете ────────────────────────────────────────────────────
-    def _search_internet(self) -> List[dict]:
-        svc = guess_service(self.domain)
-        self.log(f"[AI] Ищу решения для {svc} ({self.domain}) в интернете…")
-        prompt = f"""You are an expert on zapret2 anti-DPI software (github.com/bol-van/zapret2).
-
-Search the web for existing working zapret / nfqws / zapret2 bypass configurations for:
-**{self.domain}** ({svc})
-
-Search Russian forums (ntc.party, habr.com, 4pda.to), GitHub issues, gists for any nfqws/zapret configs
-that reportedly work for {svc} especially in Russia.
-
-Return ONLY a JSON array (no markdown, no text before/after) with up to 6 strategy profiles:
-[
-  {{
-    "name": "short name",
-    "source": "URL or 'web-search'",
-    "filter_tcp": "443",
-    "filter_udp": "",
-    "filter_l7": "tls",
-    "out_range": "-d10",
-    "desync": ["lua-desync-arg1", "lua-desync-arg2"],
-    "multiprofile": false,
-    "profiles": []
-  }}
-]
-Only valid zapret2 --lua-desync arguments. Return JSON array ONLY."""
-
-        data = call_claude_api(self.cfg, {
-            "model": CLAUDE_MODEL, "max_tokens": 2000,
-            "tools": [{"type":"web_search_20250305","name":"web_search"}],
-            "messages": [{"role":"user","content":prompt}]
-        })
-        if not data: return []
-        text = extract_text(data)
-        try:
-            result = parse_json_from_text(text)
-            if result:
-                self.log(f"[AI] Найдено {len(result)} вариантов из интернета")
-                return result
-        except Exception: pass
-        return []
-
-    # ── AI генерация новых ───────────────────────────────────────────────────
-    def _generate_new(self, failed: List[dict]) -> List[dict]:
-        self.log("[AI] Генерирую новые стратегии…")
-        failed_json = json.dumps([
-            {"desync": p.get("desync",[]), "mp": p.get("multiprofile",False)}
-            for p in failed[:8]
-        ], ensure_ascii=False)
-        prompt = f"""You are an expert on zapret2 anti-DPI (github.com/bol-van/zapret2).
-
-Trying to bypass DPI for: **{self.domain}** ({guess_service(self.domain)})
-
-Already FAILED strategies (do not repeat):
-{failed_json}
-
-Generate 6 NEW diverse strategies. Try different approaches:
-- oob technique: oob:data=0x00 (sends out-of-band TCP data)
-- multisplit with seqovl: multisplit:pos=2:seqovl=5:seqovl_pattern=0x1603030000
-- datanoack fooling: fake:blob=fake_default_tls:tcp_flags_unset=ack
-- badseq: fakedsplit:pos=method+2:tcp_ack=-66000:tcp_ts_up
-- wssize combination: wssize:wsize=1:scale=6 then syndata
-- ipfrag: send:ipfrag then drop
-- pktmod: pktmod:ip_ttl=1 for incoming packets
-- QUIC+TLS combo multiprofile
-
-Return ONLY JSON array, no text before/after:
-[{{"name":"..","source":"generated","filter_tcp":"443","filter_udp":"","filter_l7":"tls","out_range":"-d10","desync":["arg1"],"multiprofile":false,"profiles":[]}}]"""
-
-        data = call_claude_api(self.cfg, {
-            "model": CLAUDE_MODEL, "max_tokens": 1500,
-            "messages": [{"role":"user","content":prompt}]
-        })
-        if not data: return []
-        try:
-            result = parse_json_from_text(extract_text(data))
-            if result:
-                self.log(f"[AI] Сгенерировано {len(result)} новых вариантов")
-                return result
-        except Exception: pass
-        return []
-
-    # ── тест стратегии ───────────────────────────────────────────────────────
-    def _test(self, profile: dict) -> Tuple[bool, str]:
-        binary = find_binary(self.cfg)
-        if not binary:
-            return False, "бинарник не найден"
-
-        # Временный hostlist только для тестируемого домена
-        hl = f"/tmp/z2test_{int(time.time())}.txt"
-        try:
-            with open(hl,"w") as f: f.write(self.domain + "\n")
-            p2 = dict(profile)
-            p2["hostlist"] = hl
-            cmd = build_cmdline(self.cfg, p2)
-        except Exception as e:
-            return False, str(e)
-
-        self.log(f"[AI]   cmd: {' '.join(cmd[:6])}…")
-        try:
-            self._proc = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except PermissionError:
-            return False, "нет прав root"
-        except FileNotFoundError:
-            return False, "бинарник недоступен"
-        except Exception as e:
-            return False, str(e)
-
-        time.sleep(2.5)
-        if self._proc.poll() is not None:
-            self._kill()
-            try: os.unlink(hl)
-            except: pass
-            return False, f"процесс упал (код {self._proc.returncode})"
-
-        ok, detail = False, "timeout"
-        for _ in range(3):
-            if self._stop.is_set(): break
-            ok, detail = check_url(self.domain)
-            if ok: break
-            time.sleep(1.5)
-
-        self._kill()
-        try: os.unlink(hl)
-        except: pass
-        return ok, detail
-
-    # ── миксование ──────────────────────────────────────────────────────────
-    def _make_mixes(self, successful: List[dict], candidates: List[dict]) -> List[dict]:
-        pool = successful + candidates[:3]
-        if len(pool) < 2: return []
-        mixes = []
-        # Микс 1: лучший HTTPS + HTTP + QUIC
-        https_p = next((p for p in pool if "443" in str(p.get("filter_tcp",""))), None)
-        if https_p:
-            mixes.append({
-                "name": f"Микс: {https_p.get('name','HTTPS')[:20]} + HTTP + QUIC",
-                "source": "mixed", "multiprofile": True, "profiles": [
-                    {"filter_tcp":"80","filter_l7":"http","out_range":"-d10",
-                     "desync":["fake:blob=fake_default_http:ip_autottl=-2,3-20:tcp_md5","fakedsplit:ip_autottl=-2,3-20:tcp_md5"]},
-                    {"filter_tcp": https_p.get("filter_tcp","443"),
-                     "filter_l7":  https_p.get("filter_l7","tls"),
-                     "out_range":  https_p.get("out_range","-d10"),
-                     "desync":     https_p.get("desync",[])},
-                    {"filter_udp":"443","filter_l7":"quic",
-                     "desync":["fake:blob=fake_default_quic:repeats=11"]},
-                ]
-            })
-        # Микс 2: две HTTPS стратегии как fallback профили
-        https_all = [p for p in pool if "443" in str(p.get("filter_tcp",""))]
-        if len(https_all) >= 2:
-            a, b = https_all[0], https_all[1]
-            mixes.append({
-                "name": f"Микс: {a.get('name','')[:15]} || {b.get('name','')[:15]}",
-                "source": "mixed", "multiprofile": True, "profiles": [
-                    {"filter_tcp":"443","filter_l7":"tls","out_range":"-d10","desync": a.get("desync",[])},
-                    {"filter_tcp":"443","filter_l7":"tls","out_range":"-d10","desync": b.get("desync",[])},
-                ]
-            })
-        return mixes
-
-    # ── главный цикл ─────────────────────────────────────────────────────────
-    def _run(self):
-        domain = self.domain
-        svc = guess_service(domain)
-        self.log(f"[AI] ══════════════════════════════")
-        self.log(f"[AI] Подбор стратегии для: {domain} ({svc})")
-        self.log(f"[AI] ══════════════════════════════")
-
-        # Шаг 0: базовая проверка
-        self.progress("Базовая проверка доступности…", 0, 100)
-        ok, detail = check_url(domain)
-        if ok:
-            self.log(f"[AI] {domain} доступен без zapret ({detail})")
-            self.done(True)
-            return
-        self.log(f"[AI] Без zapret: {detail}")
-
-        successful = []
-
-        # Шаг 1: поиск в интернете (если есть API key)
-        has_key = bool(self.cfg.get("anthropic_key") or os.environ.get("ANTHROPIC_API_KEY"))
-        internet_cands = []
-        if has_key and not self._stop.is_set():
-            self.progress("Поиск решений в интернете через AI…", 5, 100)
-            internet_cands = self._search_internet()
-
-        # Шаг 2: встроенные кандидаты
-        builtin = [{
-            "name": f"builtin-{i+1}: {ds[0][:25]}",
-            "source": "builtin",
-            "filter_tcp": tcp, "filter_udp": "", "filter_l7": l7,
-            "out_range": rng, "desync": list(ds),
-            "multiprofile": False, "profiles": []
-        } for i,(tcp,l7,rng,ds) in enumerate(BUILTIN_CANDIDATES)]
-
-        # Полный мульти-профиль
-        builtin.append({
-            "name": "builtin-full: HTTP+HTTPS+QUIC",
-            "source": "builtin", "multiprofile": True,
-            "profiles": [
-                {"filter_tcp":"80","filter_l7":"http","out_range":"-d10",
-                 "desync":["fake:blob=fake_default_http:ip_autottl=-2,3-20:tcp_md5","fakedsplit:ip_autottl=-2,3-20:tcp_md5"]},
-                {"filter_tcp":"443","filter_l7":"tls","out_range":"-d10",
-                 "desync":["fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000:repeats=6","multidisorder:pos=midsld"]},
-                {"filter_udp":"443","filter_l7":"quic",
-                 "desync":["fake:blob=fake_default_quic:repeats=11"]},
-            ]
-        })
-
-        all_cands = internet_cands + builtin
-        failed = []
-        total = len(all_cands) + 12
-
-        for i, cand in enumerate(all_cands):
-            if self._stop.is_set(): break
-            name = cand.get("name", f"#{i+1}")
-            src  = cand.get("source","?")
-            self.progress(f"[{i+1}/{len(all_cands)}] {src}: {name[:35]}", i+1, total)
-            self.log(f"[AI] Тест [{i+1}]: {name}")
-            ok, detail = self._test(cand)
-            if ok:
-                self.log(f"[AI] ✓ УСПЕХ: {name} ({detail})")
-                cand["name"] = f"{svc}: {cand.get('source','?')}: {cand.get('name','')}"
-                self.found(cand)
-                successful.append(cand)
-                # Сразу строим миксы
-                mixes = self._make_mixes(successful, failed[:3])
-                for m in mixes: self.found(m)
-                self.done(True)
-                return
-            else:
-                self.log(f"[AI] ✗ {name}: {detail}")
-                failed.append(cand)
-
-        # Шаг 3: AI генерирует новые
-        if has_key and not self._stop.is_set():
-            self.progress("AI генерирует новые стратегии…", len(all_cands)+1, total)
-            ai_cands = self._generate_new(failed)
-            for i, cand in enumerate(ai_cands):
-                if self._stop.is_set(): break
-                name = cand.get("name", f"ai-{i+1}")
-                self.progress(f"[AI] Тест: {name[:35]}", len(all_cands)+i+2, total)
-                self.log(f"[AI] AI тест [{i+1}]: {name}")
-                ok, detail = self._test(cand)
-                if ok:
-                    self.log(f"[AI] ✓ УСПЕХ (AI): {name}")
-                    cand["name"] = f"{svc} [AI]: {name}"
-                    self.found(cand)
-                    mixes = self._make_mixes([cand], failed[:3])
-                    for m in mixes: self.found(m)
-                    self.done(True)
-                    return
-                else:
-                    self.log(f"[AI] ✗ AI: {name}: {detail}")
-                    failed.append(cand)
-
-        # Шаг 4: попытка миксов из провалившихся
-        if not self._stop.is_set() and len(failed) >= 2:
-            self.progress("Тестирую комбинированные профили…", total-2, total)
-            mixes = self._make_mixes([], failed[:5])
-            for cand in mixes:
-                if self._stop.is_set(): break
-                name = cand.get("name","mix")
-                self.log(f"[AI] Микс тест: {name}")
-                ok, detail = self._test(cand)
-                if ok:
-                    self.log(f"[AI] ✓ УСПЕХ (Микс): {name}")
-                    cand["name"] = f"{svc} [Микс]"
-                    self.found(cand)
-                    self.done(True)
-                    return
-
-        self.log(f"[AI] Не нашёл рабочей стратегии для {domain}")
-        self.done(False)
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  CURSES COLORS
@@ -843,16 +500,28 @@ class ZapretTUI:
 
     # ── AI подбор стратегии ───────────────────────────────────────────────────
     def ai_strategy_menu(self):
-        # Проверка API key
-        has_key = bool(self.cfg.get("anthropic_key") or os.environ.get("ANTHROPIC_API_KEY"))
+        # Проверяем наличие хоть какого-то ключа
+        provider = get_active_provider(self.cfg)
+        has_key  = bool(get_api_key(provider, self.cfg))
+
         if not has_key:
-            key = self.inputbox(
-                "API ключ Anthropic (для web-поиска):\n(пусто = работать без AI, только встроенные)",
-                "", "Anthropic API Key"
+            # Предлагаем настроить провайдера
+            choice = self.menu(
+                ["🤖 Настроить Claude (Anthropic)",
+                 "💬 Настроить ChatGPT (OpenAI)",
+                 "⚡ Продолжить без AI (только встроенные стратегии)",
+                 "← Назад"],
+                "AI ключ не настроен", y_off=4, x_off=4
             )
-            if key:
-                self.cfg["anthropic_key"] = key
-                save_config(self.cfg)
+            if choice == 3 or choice == -1:
+                return
+            elif choice == 0:
+                self._setup_ai_provider("claude")
+                provider = "claude"
+            elif choice == 1:
+                self._setup_ai_provider("openai")
+                provider = "openai"
+            # choice == 2 — продолжаем без ключа
 
         domain_raw = self.inputbox(
             "Сайт/домен/IP для разблокировки:",
@@ -1043,9 +712,10 @@ class ZapretTUI:
 
     def _ai_search_only(self, domain: str, svc: str):
         """Только поиск без тестирования."""
-        has_key = bool(self.cfg.get("anthropic_key") or os.environ.get("ANTHROPIC_API_KEY"))
+        provider = get_active_provider(self.cfg)
+        has_key  = bool(get_api_key(provider, self.cfg))
         if not has_key:
-            self.msgbox("Для поиска нужен Anthropic API ключ.\nНастройки → API ключ", "Нет ключа")
+            self.msgbox("Для поиска нужен API ключ.\n6 → Настройки → AI провайдер", "Нет ключа")
             return
 
         self.add_log(f"[AI] Поиск решений для {domain}…")
@@ -1056,7 +726,7 @@ class ZapretTUI:
             finder = StrategyFinder(domain, self.cfg,
                                     self.add_log, lambda *a: None,
                                     lambda p: results.append(p), lambda s: done.set())
-            candidates = finder._search_internet()
+            candidates = finder.search_internet()
             for c in candidates:
                 c["name"] = f"{svc} [web]: {c.get('name','?')}"
                 results.append(c)
@@ -1263,30 +933,130 @@ class ZapretTUI:
                 elif act==3 and idx<len(lst)-1: lst[idx],lst[idx+1]=lst[idx+1],lst[idx]
         return lst
 
+    # ── Настройки AI провайдера ───────────────────────────────────────────────
+    def _setup_ai_provider(self, provider: str):
+        """Мастер настройки API ключа для провайдера."""
+        info = AI_PROVIDERS[provider]
+        cur_key = get_api_key(provider, self.cfg)
+        cur_masked = mask_key(cur_key) if cur_key else "(не задан)"
+        model = get_model(provider, self.cfg)
+
+        h, w = self.scr.getmaxyx()
+        self.msgbox(
+            f"Провайдер: {info['name']}\n"
+            f"Текущий ключ: {cur_masked}\n"
+            f"Модель: {model}\n\n"
+            f"Ключ хранится в файле .env (не в коде).\n"
+            f"Получить ключ: {info['get_key_url']}",
+            f"Настройка {info['name']}"
+        )
+
+        key = self.inputbox(
+            f"API ключ для {info['name']}:",
+            "", f"Введите ключ"
+        )
+        if key and key.strip():
+            key = key.strip()
+            # Сохраняем в .env, не в конфиг
+            save_api_key_to_env(provider, key)
+            save_provider_to_env(provider)
+            self.cfg["ai_provider"] = provider
+            save_config(self.cfg)
+            self.add_log(f"[CFG] Ключ {info['name']} сохранён в .env")
+
+            # Проверяем ключ
+            self.scr.clear()
+            self.draw_title()
+            h2, w2 = self.scr.getmaxyx()
+            try:
+                self.scr.addstr(h2//2, w2//2-15,
+                                "Проверяю ключ…",
+                                curses.color_pair(C_AI)|curses.A_BOLD)
+            except curses.error: pass
+            self.scr.refresh()
+            ok, detail = test_api_key(provider, self.cfg)
+            if ok:
+                self.msgbox(f"✓ {detail}\n\nПровайдер: {info['name']}\nКлюч: {mask_key(key)}", "Успех")
+            else:
+                self.msgbox(f"✗ Ошибка: {detail}\n\nПроверьте ключ и повторите.", "Ошибка")
+
+    def _select_ai_provider(self):
+        """Выбор активного AI провайдера."""
+        current = get_active_provider(self.cfg)
+        items = []
+        for pid, info in AI_PROVIDERS.items():
+            key = get_api_key(pid, self.cfg)
+            status = f"✓ {mask_key(key)}" if key else "✗ ключ не задан"
+            mark = "► " if pid == current else "  "
+            items.append(f"{mark}{info['name']}  [{status}]")
+        items.append("← Назад")
+
+        h, w = self.scr.getmaxyx()
+        idx = self.menu(items, "Выбор AI провайдера",
+                        y_off=4, x_off=4,
+                        height=min(len(items)+2, h-8),
+                        width=min(w-8, 60))
+        if idx < 0 or idx == len(items)-1:
+            return
+        provider = list(AI_PROVIDERS.keys())[idx]
+        save_provider_to_env(provider)
+        self.cfg["ai_provider"] = provider
+        save_config(self.cfg)
+        self.add_log(f"[CFG] AI провайдер: {AI_PROVIDERS[provider]['name']}")
+
     # ── Настройки ─────────────────────────────────────────────────────────────
     def settings_menu(self):
-        fields=[("zapret_dir","Директория zapret2"),("binary","Бинарник nfqws2/winws2"),
-                ("lua_lib","zapret-lib.lua путь"),("lua_antidpi","zapret-antidpi.lua путь"),
-                ("qnum","Номер NFQUEUE"),("anthropic_key","Anthropic API Key")]
         while True:
-            items=[f"{lbl:<28} {str(self.cfg.get(k,''))[:30]}" for k,lbl in fields]
-            items+=["  Проверить бинарник","← Назад"]
-            h,w=self.scr.getmaxyx()
-            idx=self.menu(items,"Настройки",y_off=2,x_off=2,
-                          height=min(len(items)+2,h-4),width=min(w-4,66))
-            if idx==-1 or idx==len(items)-1: save_config(self.cfg); break
-            elif idx==len(items)-2:
-                b=find_binary(self.cfg)
-                self.msgbox(f"Бинарник: {b or 'НЕ НАЙДЕН'}","Проверка")
-            elif idx<len(fields):
-                k,lbl=fields[idx]
-                # API key — маскируем при вводе
-                cur=str(self.cfg.get(k,""))
-                if k=="anthropic_key" and cur:
-                    cur="***скрыт***"
-                v=self.inputbox(lbl,cur,lbl)
-                if v is not None and v!="***скрыт***":
-                    self.cfg[k]=v; save_config(self.cfg)
+            # Zapret настройки
+            zap_fields = [
+                ("zapret_dir",  "Директория zapret2"),
+                ("binary",      "Бинарник nfqws2/winws2"),
+                ("lua_lib",     "zapret-lib.lua путь"),
+                ("lua_antidpi", "zapret-antidpi.lua путь"),
+                ("qnum",        "Номер NFQUEUE"),
+            ]
+            # Строим список пунктов
+            items = [f"{lbl:<28} {str(self.cfg.get(k,''))[:28]}" for k,lbl in zap_fields]
+
+            # AI секция
+            provider = get_active_provider(self.cfg)
+            pname    = AI_PROVIDERS.get(provider, {}).get("name", provider)
+            items.append(f"{'── AI Провайдер':<28} {pname}")
+
+            for pid, info in AI_PROVIDERS.items():
+                key = get_api_key(pid, self.cfg)
+                val = mask_key(key) if key else "(не задан)"
+                items.append(f"  {info['name']:<26} {val}")
+
+            items += ["  Проверить бинарник", "  Проверить безопасность .env", "← Назад"]
+            h, w = self.scr.getmaxyx()
+            idx = self.menu(items, "Настройки", y_off=2, x_off=2,
+                            height=min(len(items)+2, h-4), width=min(w-4, 68))
+            total = len(zap_fields) + 1 + len(AI_PROVIDERS)
+            if idx == -1 or idx == len(items)-1:
+                save_config(self.cfg); break
+            elif idx == len(items)-2:
+                # Проверка безопасности
+                warns = check_env_safety()
+                if warns:
+                    self.msgbox("\n".join(warns), "Предупреждения безопасности")
+                else:
+                    self.msgbox("✓ .env файл защищён\n✓ .gitignore настроен", "Безопасность OK")
+            elif idx == len(items)-3:
+                b = find_binary(self.cfg)
+                self.msgbox(f"Бинарник: {b or 'НЕ НАЙДЕН'}", "Проверка")
+            elif idx < len(zap_fields):
+                k, lbl = zap_fields[idx]
+                v = self.inputbox(lbl, str(self.cfg.get(k,"")), lbl)
+                if v is not None:
+                    self.cfg[k] = v; save_config(self.cfg)
+            elif idx == len(zap_fields):
+                # Выбор провайдера
+                self._select_ai_provider()
+            elif idx < total:
+                # Настройка конкретного провайдера
+                pid = list(AI_PROVIDERS.keys())[idx - len(zap_fields) - 1]
+                self._setup_ai_provider(pid)
 
     # ── Быстрый старт ─────────────────────────────────────────────────────────
     def quick_start(self):
@@ -1363,6 +1133,9 @@ class ZapretTUI:
             except curses.error: pass
 
         b=find_binary(self.cfg)
+        provider = get_active_provider(self.cfg)
+        pname    = AI_PROVIDERS.get(provider, {}).get("name", provider)
+        has_key  = bool(get_api_key(provider, self.cfg))
         try:
             iw.addstr(5,3,"Бинарник:",curses.color_pair(C_KEY))
             iw.addstr(5,13,(b or "НЕ НАЙДЕН")[:iw_w-15],
@@ -1371,18 +1144,22 @@ class ZapretTUI:
             iw.addstr(7,15,self.cfg["zapret_dir"][:iw_w-17],curses.color_pair(C_DIM))
             iw.addstr(9,3,"Профилей:",curses.color_pair(C_KEY))
             iw.addstr(9,13,str(len(self.cfg.get("profiles",[]))),curses.color_pair(C_DIM))
+            iw.addstr(11,3,"AI:",curses.color_pair(C_KEY))
+            ai_status = f"{pname}  {'✓ ключ есть' if has_key else '✗ ключ не задан'}"
+            iw.addstr(11,7,ai_status[:iw_w-9],
+                      curses.color_pair(C_OK) if has_key else curses.color_pair(C_WARN))
         except curses.error: pass
 
         # Лог превью
-        try: iw.addstr(11,3,"Последний лог:",curses.color_pair(C_KEY))
+        try: iw.addstr(13,3,"Последний лог:",curses.color_pair(C_KEY))
         except curses.error: pass
-        for i,ln in enumerate(self.log_lines[-(ph-14):]):
-            if 12+i>=ph-1: break
+        for i,ln in enumerate(self.log_lines[-(ph-16):]):
+            if 14+i>=ph-1: break
             if "[AI]" in ln: a=curses.color_pair(C_AI)
             elif "✓" in ln:  a=curses.color_pair(C_OK)
             elif "✗" in ln or "ОШИБК" in ln.upper(): a=curses.color_pair(C_WARN)
             else: a=curses.color_pair(C_DIM)
-            try: iw.addstr(12+i,3,ln[:iw_w-5],a)
+            try: iw.addstr(14+i,3,ln[:iw_w-5],a)
             except curses.error: pass
         iw.refresh()
         self.draw_statusbar()

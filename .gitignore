@@ -1,5 +1,41 @@
-__pycache__/
-*.pyc
+# ── Секреты — НИКОГДА не загружать на GitHub ──
 .env
+*.env
+.env.local
+.env.production
+
+# ── Конфиг пользователя с ключами ──
+~/.zapret2-tui.json
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# ── Виртуальное окружение ──
+venv/
+.venv/
+env/
+.env/
+
+# ── Временные файлы ──
+/tmp/z2test_*.txt
 *.log
-profiles/
+*.tmp
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── macOS ──
+.DS_Store
