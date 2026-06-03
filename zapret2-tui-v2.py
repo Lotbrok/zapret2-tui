@@ -231,18 +231,63 @@ class ZapretTUI:
     def __init__(self, scr):
         self.scr = scr
         self.cfg = load_config()
-        self.proc: Optional[subprocess.Popen] = None
-        self.log_lines: List[str] = []
+        self.proc = None
+        self.log_lines = []
         self.status_msg = ""
-        # AI state
-        self.ai_finder: Optional[StrategyFinder] = None
+        self.ai_finder = None
         self.ai_progress = ("Ожидание…", 0, 100)
-        self.ai_new_results: List[dict] = []  # потокобезопасная очередь
+        self.ai_new_results = []
         self._ai_lock = threading.Lock()
         self._ai_done = False
         self._ai_success = False
+        # Features init
+        from zapret2_features import (
+            load_features, save_features,
+            HostlistManager, DomainMonitor,
+            Watchdog, AutostartManager, StrategyUpdater,
+        )
+        self._save_features = save_features
+        self.feat      = load_features()
+        self.hlm       = HostlistManager(self.cfg["zapret_dir"])
+        self.monitor   = DomainMonitor(self.feat.get("monitor_interval", 30))
+        self.watchdog  = Watchdog(self.cfg, self.feat,
+                                  log_cb=self.add_log,
+                                  switch_cb=self._watchdog_switch,
+                                  get_proc_cb=lambda: self.proc)
+        self.autostart = AutostartManager(self.cfg, self.feat, self.add_log)
+        self.updater   = StrategyUpdater(self.cfg, self.feat,
+                                         log_cb=self.add_log,
+                                         new_profile_cb=self._on_new_profile)
+        self._start_bg()
         self._setup()
         self.main_loop()
+
+    def _start_bg(self):
+        monitor_hl = self.hlm.get_monitor_hostlist()
+        domains = self.hlm.read_domains(monitor_hl)
+        if domains:
+            self.monitor.set_domains(domains)
+            self.monitor.start()
+        if self.feat.get("watchdog_enabled"):
+            self.watchdog.start()
+        if self.feat.get("autoupdate_enabled"):
+            self.updater.start()
+
+    def _watchdog_switch(self):
+        profiles = self.cfg.get("profiles", [])
+        if not profiles:
+            self.add_log("[WD] Нет профилей для переключения"); return
+        cur_idx = next((i for i,p in enumerate(profiles)
+                        if p.get("name") == self.status_msg), -1)
+        nxt = profiles[(cur_idx + 1) % len(profiles)]
+        self.add_log(f"[WD] Переключаюсь на: {nxt.get('name')}")
+        self.stop_zapret()
+        time.sleep(1)
+        self.start_zapret(nxt)
+
+    def _on_new_profile(self, profile):
+        self.cfg.setdefault("profiles", []).append(profile)
+        save_config(self.cfg)
 
     def _setup(self):
         curses.curs_set(0); self.scr.keypad(True); init_colors()
@@ -1103,7 +1148,13 @@ class ZapretTUI:
         items=[("1","Быстрый старт"),("2","Мои профили"),
                ("3","🤖 AI подбор стратегии"),("4","🔀 Смешать профили"),
                ("5","Предпросмотр команды"),("6","Настройки"),
-               ("7","blockcheck2"),("L","Лог"),("S","Стоп"),("Q","Выход")]
+               ("7","blockcheck2"),
+               ("8","📋 Хостлисты"),
+               ("9","📊 Мониторинг"),
+               ("W","⚙  Watchdog"),
+               ("A","🚀 Автозапуск"),
+               ("U","🔄 Автообновление"),
+               ("L","Лог"),("S","Стоп"),("Q","Выход")]
         for i,(k,lbl) in enumerate(items):
             try:
                 mw.addstr(i+2,2,f" {k} ",curses.color_pair(C_KEY)|curses.A_BOLD)
@@ -1164,6 +1215,501 @@ class ZapretTUI:
         iw.refresh()
         self.draw_statusbar()
 
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  HOSTLIST EDITOR
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def hostlist_editor(self):
+        """Полноэкранный редактор хостлистов."""
+        while True:
+            files = self.hlm.list_files()
+            h, w = self.scr.getmaxyx()
+            items = []
+            for f in files:
+                icon = "📋" if f["source"] == "zapret2" else "✏ "
+                items.append(f"{icon} {f['name']:<30} {f['count']:>4} доменов  [{f['source']}]")
+            items += ["  + Создать новый хостлист",
+                      "  📥 Импорт из URL",
+                      "  🔍 Мониторинг-лист (домены для дашборда)",
+                      "← Назад"]
+            idx = self.menu(items, "Редактор хостлистов",
+                            y_off=2, x_off=2,
+                            height=min(len(items)+2, h-4),
+                            width=min(w-4, 72))
+            n_files = len(files)
+            if idx == -1 or idx == len(items)-1:
+                break
+            elif idx == n_files:
+                self._hl_create_new()
+            elif idx == n_files+1:
+                self._hl_import_url()
+            elif idx == n_files+2:
+                self._hl_edit_monitor()
+            elif idx < n_files:
+                self._hl_open_file(files[idx])
+
+    def _hl_open_file(self, finfo: dict):
+        """Открывает файл для редактирования."""
+        path    = finfo["path"]
+        is_zap  = finfo["source"] == "zapret2"
+        while True:
+            domains = self.hlm.read_domains(path)
+            h, w   = self.scr.getmaxyx()
+            title  = f"{finfo['name']} ({len(domains)} доменов)"
+            # Строим список доменов
+            items = [f"  {d}" for d in domains[:200]]
+            if not items:
+                items = ["  (файл пуст)"]
+            if not is_zap:
+                items += ["  + Добавить домен", "  🗑  Очистить всё"]
+            items += ["  📊 Использовать в мониторинге", "← Назад"]
+
+            idx = self.menu(items, title,
+                            y_off=2, x_off=2,
+                            height=min(len(items)+2, h-4),
+                            width=min(w-4, 65))
+            if idx == -1 or idx == len(items)-1:
+                break
+
+            offset = len(domains) if domains else 1  # позиция "+ Добавить"
+            if not is_zap and idx == offset:
+                # Добавить домен
+                d = self.inputbox("Введите домен:", "", "Добавить")
+                if d:
+                    d = d.strip().lower()
+                    self.hlm.add_domain(path, d)
+                    self.add_log(f"[HL] Добавлен: {d} → {finfo['name']}")
+            elif not is_zap and idx == offset+1:
+                # Очистить
+                if self.confirm(f"Очистить {finfo['name']}? ({len(domains)} доменов)"):
+                    self.hlm.write_domains(path, [])
+            elif idx == len(items)-2:
+                # Мониторинг
+                self._add_to_monitor(domains)
+            elif idx < len(domains) and not is_zap:
+                # Редактировать/удалить домен
+                domain = domains[idx]
+                act = self.menu(
+                    [f"✏  Редактировать: {domain}",
+                     f"🗑  Удалить: {domain}",
+                     "← Назад"],
+                    "Действие", y_off=5, x_off=5)
+                if act == 0:
+                    nd = self.inputbox("Домен:", domain)
+                    if nd and nd != domain:
+                        self.hlm.remove_domain(path, domain)
+                        self.hlm.add_domain(path, nd.strip().lower())
+                elif act == 1:
+                    self.hlm.remove_domain(path, domain)
+                    self.add_log(f"[HL] Удалён: {domain}")
+
+    def _hl_create_new(self):
+        name = self.inputbox("Имя нового хостлиста (без .txt):", "my-list", "Новый файл")
+        if not name:
+            return
+        domains_raw = self.inputbox("Домены через запятую или пробел:", "", "Домены")
+        domains = []
+        if domains_raw:
+            domains = [d.strip().lower() for d in re.split(r'[,\s]+', domains_raw) if d.strip()]
+        path = self.hlm.create_custom(name, domains)
+        self.add_log(f"[HL] Создан: {path} ({len(domains)} доменов)")
+        self.msgbox(f"Создан файл:\n{path}\n\nДоменов: {len(domains)}", "Готово")
+
+    def _hl_import_url(self):
+        url = self.inputbox("URL файла со списком доменов:", "https://", "Импорт из URL")
+        if not url or url == "https://":
+            return
+        name = self.inputbox("Имя файла (без .txt):", "imported", "Имя")
+        if not name:
+            return
+        self.scr.clear(); self.draw_title()
+        h, w = self.scr.getmaxyx()
+        try:
+            self.scr.addstr(h//2, w//2-20,
+                            f" Загрузка… {url[:40]} ",
+                            curses.color_pair(C_AI)|curses.A_BOLD)
+        except curses.error: pass
+        self.scr.refresh()
+        ok, msg = self.hlm.import_from_url(url, name)
+        self.msgbox(msg, "Импорт: " + ("OK" if ok else "Ошибка"))
+        if ok:
+            self.add_log(f"[HL] Импорт: {msg}")
+
+    def _hl_edit_monitor(self):
+        """Редактирует список доменов для мониторинга."""
+        path = self.hlm.get_monitor_hostlist()
+        self._hl_open_file({
+            "name":   "monitor.txt",
+            "path":   path,
+            "source": "custom",
+            "count":  self.hlm._count_lines(path),
+        })
+        # Перезагружаем домены монитора
+        domains = self.hlm.read_domains(path)
+        self.monitor.set_domains(domains)
+        if domains and not self.monitor._thread:
+            self.monitor.start()
+        self.feat["monitor_domains"] = domains
+        self._save_features(self.feat)
+
+    def _add_to_monitor(self, domains: list):
+        """Добавляет список доменов в мониторинг."""
+        path = self.hlm.get_monitor_hostlist()
+        cur  = self.hlm.read_domains(path)
+        added = 0
+        for d in domains:
+            if d not in cur:
+                self.hlm.add_domain(path, d)
+                added += 1
+        self.monitor.set_domains(self.hlm.read_domains(path))
+        if not self.monitor._thread:
+            self.monitor.start()
+        self.msgbox(f"Добавлено {added} доменов в мониторинг.", "Мониторинг")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  DASHBOARD — МОНИТОРИНГ ДОСТУПНОСТИ
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def show_dashboard(self):
+        """Дашборд мониторинга в реальном времени."""
+        # Убеждаемся что монитор запущен
+        monitor_hl = self.hlm.get_monitor_hostlist()
+        domains = self.hlm.read_domains(monitor_hl)
+        if not domains:
+            choice = self.confirm(
+                "Список доменов для мониторинга пуст.\nОткрыть редактор хостлистов?",
+                "Нет доменов"
+            )
+            if choice:
+                self._hl_edit_monitor()
+            return
+
+        self.monitor.set_domains(domains)
+        if not (self.monitor._thread and self.monitor._thread.is_alive()):
+            self.monitor.start()
+
+        scroll = 0
+        while True:
+            self.poll_proc()
+            self._draw_dashboard(scroll)
+            self.scr.timeout(500)
+            k = self.scr.getch()
+            if k in (27, ord('q'), ord('Q')):
+                break
+            elif k == curses.KEY_UP:    scroll = max(0, scroll-1)
+            elif k == curses.KEY_DOWN:  scroll += 1
+            elif k == curses.KEY_PPAGE: scroll = max(0, scroll-10)
+            elif k == curses.KEY_NPAGE: scroll += 10
+            elif k == curses.KEY_HOME:  scroll = 0
+            elif k in (ord('r'), ord('R')):
+                # Принудительная перепроверка всех
+                for s in self.monitor.get_statuses():
+                    self.monitor.check_now(s.domain)
+            elif k in (ord('e'), ord('E')):
+                self._hl_edit_monitor()
+                domains = self.hlm.read_domains(monitor_hl)
+                self.monitor.set_domains(domains)
+            elif k in (ord('a'), ord('A')):
+                # Добавить домен быстро
+                d = self.inputbox("Домен для мониторинга:", "", "Добавить")
+                if d:
+                    self.hlm.add_domain(monitor_hl, d.strip().lower())
+                    self.monitor.set_domains(self.hlm.read_domains(monitor_hl))
+
+    def _draw_dashboard(self, scroll: int = 0):
+        """Рисует дашборд мониторинга."""
+        self.scr.clear()
+        h, w = self.scr.getmaxyx()
+
+        # Заголовок
+        title = " 📊 МОНИТОРИНГ ДОСТУПНОСТИ "
+        try:
+            self.scr.addstr(0, 0,
+                            title.center(w),
+                            curses.color_pair(C_TITLE)|curses.A_BOLD)
+        except curses.error: pass
+
+        statuses = self.monitor.get_statuses()
+        total = len(statuses)
+        ok_c  = sum(1 for s in statuses if s.ok is True)
+        fail_c= sum(1 for s in statuses if s.ok is False)
+        unk_c = sum(1 for s in statuses if s.ok is None)
+
+        # Сводка
+        try:
+            self.scr.addstr(1, 2,
+                f" Всего: {total}  ",
+                curses.color_pair(C_DIM))
+            self.scr.addstr(1, 14,
+                f"✓ Доступно: {ok_c}  ",
+                curses.color_pair(C_OK)|curses.A_BOLD)
+            self.scr.addstr(1, 32,
+                f"✗ Недоступно: {fail_c}  ",
+                curses.color_pair(C_WARN)|curses.A_BOLD)
+            self.scr.addstr(1, 52,
+                f"? Проверяется: {unk_c}",
+                curses.color_pair(C_DIM))
+        except curses.error: pass
+
+        # Заголовок таблицы
+        col_w = min(w-2, 78)
+        hdr = f" {'ДОМЕН':<28} {'СТАТУС':<12} {'КОД':<8} {'МС':>5}  {'АПТАЙМ':>6}  {'ИСТОРИЯ':<12} {'ПРОВЕРЕН'}"
+        try:
+            self.scr.addstr(2, 0, hdr[:w-1], curses.color_pair(C_KEY)|curses.A_BOLD)
+            self.scr.addstr(3, 0, "─"*min(w-1, col_w), curses.color_pair(C_BORDER))
+        except curses.error: pass
+
+        # Строки доменов
+        vis_rows = h - 8
+        scroll = min(scroll, max(0, total - vis_rows))
+        for i in range(vis_rows):
+            idx = i + scroll
+            if idx >= total:
+                break
+            s = statuses[idx]
+            row = 4 + i
+
+            # Цвет и статус
+            if s.ok is True:
+                status_str = "● ДОСТУПЕН"
+                status_attr = curses.color_pair(C_OK)|curses.A_BOLD
+                row_attr   = curses.color_pair(C_OK)
+            elif s.ok is False:
+                status_str = "✗ БЛОКИРОВАН"
+                status_attr = curses.color_pair(C_WARN)|curses.A_BOLD
+                row_attr   = curses.color_pair(C_WARN)
+            else:
+                status_str = "○ проверка…"
+                status_attr = curses.color_pair(C_DIM)
+                row_attr   = curses.color_pair(C_DIM)
+
+            uptime_str = f"{s.uptime_pct:3d}%" if s.history else "  -  "
+            lat_str    = f"{s.latency_ms:4d}" if s.latency_ms else "   -"
+            code_str   = s.http_code[:7] if s.http_code else "  -   "
+            age_str    = s.age_str
+
+            try:
+                # Домен
+                self.scr.addstr(row, 1,
+                    f" {s.domain:<28}",
+                    curses.color_pair(C_DIM))
+                # Статус (цветной)
+                self.scr.addstr(row, 30,
+                    f"{status_str:<12}", status_attr)
+                # Код
+                self.scr.addstr(row, 43,
+                    f"{code_str:<8}", row_attr)
+                # Задержка
+                self.scr.addstr(row, 51,
+                    f"{lat_str:>5}ms", curses.color_pair(C_DIM))
+                # Аптайм
+                self.scr.addstr(row, 59,
+                    f"{uptime_str:>6}", row_attr)
+                # История — мини-график с цветами
+                self.scr.addstr(row, 67, " ")
+                for j, h_ok in enumerate(s.history[-10:]):
+                    c = curses.color_pair(C_OK) if h_ok else curses.color_pair(C_WARN)
+                    try:
+                        self.scr.addstr(row, 68+j, "▓" if h_ok else "░", c)
+                    except curses.error: pass
+                # Время проверки
+                self.scr.addstr(row, 80, f" {age_str}", curses.color_pair(C_DIM))
+            except curses.error:
+                pass
+
+        # Нижняя панель подсказок
+        hint_row = h - 3
+        try:
+            self.scr.addstr(hint_row, 0, "─"*min(w-1, col_w), curses.color_pair(C_BORDER))
+            self.scr.addstr(hint_row+1, 1,
+                " R перепроверить  A добавить  E редактировать  ↑↓ прокрутка  Q выход ",
+                curses.color_pair(C_KEY))
+            # Интервал обновления
+            interval = self.feat.get("monitor_interval", 30)
+            self.scr.addstr(hint_row+2, 1,
+                f" Интервал обновления: {interval}с  |  Мониторинг активен",
+                curses.color_pair(C_DIM))
+        except curses.error: pass
+
+        self.draw_statusbar()
+        self.scr.refresh()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  WATCHDOG MENU
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def watchdog_menu(self):
+        while True:
+            enabled  = self.feat.get("watchdog_enabled", False)
+            interval = self.feat.get("watchdog_interval", 60)
+            thresh   = self.feat.get("watchdog_fail_threshold", 3)
+            domains  = self.feat.get("watchdog_domains", [])
+            wd_run   = self.watchdog._thread and self.watchdog._thread.is_alive()
+
+            status_str = ("▶ АКТИВЕН" if wd_run else "■ ОСТАНОВЛЕН")
+            status_col = C_OK if wd_run else C_WARN
+
+            h, w = self.scr.getmaxyx()
+            items = [
+                f"{'[ВКЛ]' if enabled else '[ВЫКЛ]'}  Watchdog: {status_str}",
+                f"   Интервал проверки:   {interval} сек",
+                f"   Провалов до смены:   {thresh}",
+                f"   Домены для WD:       {len(domains)} ({', '.join(domains[:2])}{'…' if len(domains)>2 else ''})",
+                "   Использовать домены из мониторинга",
+                "← Назад",
+            ]
+            idx = self.menu(items, "Watchdog — автопереключение",
+                            y_off=3, x_off=3,
+                            height=min(len(items)+2, h-6),
+                            width=min(w-6, 58))
+            if idx in (-1, 5):
+                break
+            elif idx == 0:
+                # Вкл/выкл
+                enabled = not enabled
+                self.feat["watchdog_enabled"] = enabled
+                self._save_features(self.feat)
+                if enabled:
+                    self.watchdog.start()
+                else:
+                    self.watchdog.stop()
+            elif idx == 1:
+                v = self.inputbox("Интервал проверки (секунды):", str(interval))
+                if v and v.isdigit():
+                    self.feat["watchdog_interval"] = int(v)
+                    self._save_features(self.feat)
+            elif idx == 2:
+                v = self.inputbox("Провалов до переключения:", str(thresh))
+                if v and v.isdigit():
+                    self.feat["watchdog_fail_threshold"] = int(v)
+                    self._save_features(self.feat)
+            elif idx == 3:
+                raw = self.inputbox("Домены через запятую:", ", ".join(domains))
+                if raw is not None:
+                    self.feat["watchdog_domains"] = [
+                        d.strip() for d in raw.split(",") if d.strip()
+                    ]
+                    self._save_features(self.feat)
+            elif idx == 4:
+                # Взять домены из monitor-листа
+                monitor_hl = self.hlm.get_monitor_hostlist()
+                md = self.hlm.read_domains(monitor_hl)
+                if md:
+                    self.feat["watchdog_domains"] = md[:10]
+                    self._save_features(self.feat)
+                    self.msgbox(f"Загружено {min(len(md),10)} доменов из monitor.txt", "OK")
+                else:
+                    self.msgbox("monitor.txt пуст. Добавьте домены в Редактор хостлистов.", "Пусто")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  AUTOSTART MENU
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def autostart_menu(self):
+        while True:
+            is_avail = self.autostart.is_systemd_available()
+            status   = self.autostart.get_status() if is_avail else "н/д"
+            enabled  = self.feat.get("autostart_enabled", False)
+            profile  = self.feat.get("autostart_profile", "(не задан)")
+            h, w     = self.scr.getmaxyx()
+
+            items = [
+                f"Systemd: {'доступен' if is_avail else 'НЕ ДОСТУПЕН'}   Статус: {status}",
+                f"{'[ВКЛ]' if enabled else '[ВЫКЛ]'}  Автозапуск при старте системы",
+                f"   Профиль: {profile}",
+                "   Установить/обновить юнит",
+                "   Показать unit файл",
+                "   Удалить автозапуск",
+                "← Назад",
+            ]
+            idx = self.menu(items, "Автозапуск (systemd)",
+                            y_off=3, x_off=3,
+                            height=min(len(items)+2, h-6),
+                            width=min(w-6, 62))
+            if idx in (-1, 6):
+                break
+            elif idx == 1:
+                if not is_avail:
+                    self.msgbox("systemd недоступен на этой системе.", "Ошибка"); continue
+                ok, msg = self.autostart.toggle()
+                self.msgbox(msg, "OK" if ok else "Ошибка")
+            elif idx == 2:
+                # Выбрать профиль
+                profiles = self.cfg.get("profiles", [])
+                if not profiles:
+                    self.msgbox("Нет сохранённых профилей."); continue
+                names = [p.get("name","?") for p in profiles]
+                pi = self.menu(names, "Профиль для автозапуска",
+                               y_off=5, x_off=5,
+                               height=min(len(names)+2, h-8),
+                               width=min(w-8, 60))
+                if pi >= 0:
+                    self.feat["autostart_profile"] = profiles[pi].get("name","")
+                    self._save_features(self.feat)
+            elif idx == 3:
+                # Установить юнит
+                pname = self.feat.get("autostart_profile","")
+                if not pname:
+                    self.msgbox("Сначала выберите профиль (пункт 3)."); continue
+                profiles = self.cfg.get("profiles", [])
+                profile_obj = next((p for p in profiles if p.get("name")==pname), None)
+                if not profile_obj:
+                    self.msgbox(f"Профиль '{pname}' не найден."); continue
+                cmd = build_cmdline(self.cfg, profile_obj)
+                ok, msg = self.autostart.install(pname, cmd)
+                self.msgbox(msg, "Установка: " + ("OK" if ok else "Ошибка"))
+                if ok: self.add_log(f"[AS] {msg}")
+            elif idx == 4:
+                self.msgbox(self.autostart.show_unit(), "Unit файл")
+            elif idx == 5:
+                if self.confirm("Удалить автозапуск zapret2?"):
+                    ok, msg = self.autostart.remove()
+                    self.msgbox(msg, "OK" if ok else "Ошибка")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  AUTO-UPDATE MENU
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def autoupdate_menu(self):
+        while True:
+            enabled  = self.feat.get("autoupdate_enabled", False)
+            interval = self.feat.get("autoupdate_interval", 604800) // 86400  # в днях
+            next_run = self.updater.next_run_str
+            h, w     = self.scr.getmaxyx()
+
+            items = [
+                f"{'[ВКЛ]' if enabled else '[ВЫКЛ]'}  Автообновление стратегий",
+                f"   Интервал:     каждые {interval} дн.",
+                f"   Следующий:    {next_run}",
+                "   Запустить обновление сейчас",
+                "← Назад",
+            ]
+            idx = self.menu(items, "Автообновление стратегий",
+                            y_off=3, x_off=3,
+                            height=min(len(items)+2, h-6),
+                            width=min(w-6, 55))
+            if idx in (-1, 4):
+                break
+            elif idx == 0:
+                enabled = not enabled
+                self.feat["autoupdate_enabled"] = enabled
+                self._save_features(self.feat)
+                if enabled:
+                    self.updater.start()
+                else:
+                    self.updater.stop()
+            elif idx == 1:
+                v = self.inputbox("Интервал обновления (дней):", str(interval))
+                if v and v.isdigit():
+                    self.feat["autoupdate_interval"] = int(v) * 86400
+                    self._save_features(self.feat)
+            elif idx == 3:
+                if self.confirm("Запустить проверку новых стратегий через AI?"):
+                    self.updater.run_now()
+                    self.msgbox("Обновление запущено в фоне.\nРезультаты появятся в Профилях и Логе.", "Запущено")
+
+
     # ── Главный цикл ─────────────────────────────────────────────────────────
     def main_loop(self):
         while True:
@@ -1195,6 +1741,11 @@ class ZapretTUI:
             elif k==ord('5'): self.preview_cmd()
             elif k==ord('6'): self.settings_menu()
             elif k==ord('7'): self.run_blockcheck()
+            elif k==ord('8'): self.hostlist_editor()
+            elif k==ord('9'): self.show_dashboard()
+            elif k in (ord('w'),ord('W')): self.watchdog_menu()
+            elif k in (ord('a'),ord('A')): self.autostart_menu()
+            elif k in (ord('u'),ord('U')): self.autoupdate_menu()
             elif k in (ord('l'),ord('L')): self.show_log()
             elif k in (ord('s'),ord('S')):
                 if self.proc and self.proc.poll() is None:
@@ -1202,6 +1753,9 @@ class ZapretTUI:
                 else: self.status_msg="Процесс не запущен"
 
         self.stop_zapret()
+        self.monitor.stop()
+        self.watchdog.stop()
+        self.updater.stop()
         if self.ai_finder and not self._ai_done:
             self.ai_finder.stop()
 
@@ -1215,3 +1769,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
