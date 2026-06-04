@@ -34,13 +34,16 @@ CONFIG_FILE = os.path.expanduser("~/.zapret2-tui.json")
 DEFAULT_CONFIG = {
     "zapret_dir":  "/opt/zapret2",
     "binary":      "nfqws2",
+    # При первом запуске find_binary сам найдёт бинарник через рекурсивный поиск
+    # Реальные пути на большинстве систем:
+    #   /opt/zapret2/nfq2/nfqws2          (zapret2 из systemd)
+    #   /opt/zapret2/binaries/my/nfqws2   (скомпилированный вручную)
     "lua_lib":     "lua/zapret-lib.lua",
     "lua_antidpi": "lua/zapret-antidpi.lua",
     "qnum":        "200",
     "profiles":    [],
     "ai_results":  [],
-    "ai_provider": "",   # claude | openai | "" (автовыбор из .env)
-    # КЛЮЧИ НЕ ХРАНЯТСЯ ЗДЕСЬ — только в .env файле
+    "ai_provider": "",
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -249,6 +252,10 @@ class ZapretTUI:
         self._save_features = save_features
         self.feat      = load_features()
         self.hlm       = HostlistManager(self.cfg["zapret_dir"])
+
+        # Автоопределение бинарника при первом запуске
+        self._auto_detect_binary()
+
         self.monitor   = DomainMonitor(self.feat.get("monitor_interval", 30))
         self.watchdog  = Watchdog(self.cfg, self.feat,
                                   log_cb=self.add_log,
@@ -285,6 +292,25 @@ class ZapretTUI:
         self.stop_zapret()
         time.sleep(1)
         self.start_zapret(nxt)
+
+    def _auto_detect_binary(self):
+        """
+        Если бинарник не найден по текущим настройкам —
+        автоматически ищет его в zapret_dir и обновляет конфиг.
+        """
+        from zapret2_tui_helpers import find_binary, find_binary_auto
+        if find_binary(self.cfg):
+            return  # уже найден — ничего не делаем
+
+        # Пробуем найти автоматически
+        full_path, name = find_binary_auto(self.cfg["zapret_dir"])
+        if full_path:
+            self.cfg["binary"] = name
+            save_config(self.cfg)
+            self.add_log(f"[CFG] Бинарник найден автоматически: {full_path}")
+        else:
+            self.add_log(f"[CFG] Бинарник не найден в {self.cfg['zapret_dir']}")
+            self.add_log("[CFG] Укажите путь вручную: меню 6 → Настройки")
 
     def _on_new_profile(self, profile):
         self.cfg.setdefault("profiles", []).append(profile)
