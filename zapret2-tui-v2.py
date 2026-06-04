@@ -258,8 +258,9 @@ class ZapretTUI:
         self.updater   = StrategyUpdater(self.cfg, self.feat,
                                          log_cb=self.add_log,
                                          new_profile_cb=self._on_new_profile)
-        self._start_bg()
+        # ВАЖНО: _setup() ДО _start_bg() — сначала инициализируем curses
         self._setup()
+        self._start_bg()
         self.main_loop()
 
     def _start_bg(self):
@@ -1761,10 +1762,78 @@ class ZapretTUI:
 
 # ──────────────────────────────────────────────────────────────────────────────
 
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zapret2-tui.log")
+
+def _write_crash_log(exc: Exception):
+    import traceback
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            import datetime
+            f.write(f"\n{'='*60}\n")
+            f.write(f"CRASH {datetime.datetime.now()}\n")
+            f.write(traceback.format_exc())
+            f.write(f"{'='*60}\n")
+    except Exception:
+        pass
+
 def main():
-    def run(scr): ZapretTUI(scr)
-    try: curses.wrapper(run)
-    except KeyboardInterrupt: pass
+    # Предварительная проверка импортов ДО запуска curses
+    # чтобы ошибка импорта выводилась нормально в терминал
+    missing = []
+    for mod in ("zapret2_config", "zapret2_ai", "zapret2_tui_helpers", "zapret2_features"):
+        try:
+            __import__(mod)
+        except ImportError as e:
+            missing.append(f"  {mod}: {e}")
+        except Exception as e:
+            missing.append(f"  {mod}: {e}")
+
+    if missing:
+        print("ОШИБКА: не удалось загрузить модули:")
+        for m in missing:
+            print(m)
+        print(f"\nУбедитесь что все файлы лежат в одной папке:")
+        print("  zapret2-tui-v2.py")
+        print("  zapret2_config.py")
+        print("  zapret2_ai.py")
+        print("  zapret2_tui_helpers.py")
+        print("  zapret2_features.py")
+        sys.exit(1)
+
+    def run(scr):
+        try:
+            ZapretTUI(scr)
+        except Exception as e:
+            # Восстанавливаем терминал перед выводом ошибки
+            try:
+                curses.nocbreak()
+                scr.keypad(False)
+                curses.echo()
+                curses.endwin()
+            except Exception:
+                pass
+            _write_crash_log(e)
+            import traceback
+            print("\n" + "="*60)
+            print("ОШИБКА запret2-tui:")
+            print("="*60)
+            traceback.print_exc()
+            print("="*60)
+            print(f"\nПолный лог сохранён в: {LOG_FILE}")
+            print("Нажмите Enter для выхода...")
+            try:
+                input()
+            except Exception:
+                pass
+            raise  # пробрасываем чтобы curses.wrapper сам восстановил терминал
+
+    try:
+        curses.wrapper(run)
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        pass  # уже обработано внутри run()
+
     print("\nzapret2-tui завершён.")
 
 if __name__ == "__main__":
