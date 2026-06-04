@@ -1,74 +1,76 @@
-"""zapret2_tui_helpers.py — переиспользуемые функции из zapret2-tui (build_cmdline, find_binary)"""
+"""zapret2_tui_helpers.py — переиспользуемые функции из zapret2-tui"""
 import os
 import shlex
 import glob
-from typing import Optional, List
+from typing import Optional, List, Tuple
+
 
 def find_binary(cfg: dict) -> Optional[str]:
     """
-    Ищет бинарник nfqws2 по всем возможным путям.
-    Поддерживает структуру zapret2: binaries/my/, nfq2/, binaries/.
+    Ищет бинарник nfqws2.
+    cfg["binary"] может быть именем ("nfqws2") или полным путём ("/opt/zapret2/nfq2/nfqws2").
     """
     import shutil
     zdir   = cfg.get("zapret_dir", "/opt/zapret2")
     binary = cfg.get("binary", "nfqws2")
 
-    candidates = [
-        # Явный путь если пользователь задал полный путь
-        binary if os.path.isabs(binary) else None,
-        # Корень zapret_dir
-        os.path.join(zdir, binary),
-        # nfq2/ — путь из systemd лога
-        os.path.join(zdir, "nfq2", binary),
-        # binaries/my/ — реальная структура на машине пользователя
-        os.path.join(zdir, "binaries", "my", binary),
-        # binaries/ напрямую
-        os.path.join(zdir, "binaries", binary),
-        # bin/
-        os.path.join(zdir, "bin", binary),
-    ]
+    # Случай 1: binary — уже полный путь
+    if os.path.isabs(binary) and os.path.isfile(binary):
+        return binary
 
+    # Случай 2: имя файла — ищем по всем известным путям
+    name = os.path.basename(binary)  # на случай если путь частичный
+    candidates = [
+        os.path.join(zdir, "nfq2",         name),   # /opt/zapret2/nfq2/nfqws2
+        os.path.join(zdir, "binaries","my", name),   # /opt/zapret2/binaries/my/nfqws2
+        os.path.join(zdir, "binaries",      name),   # /opt/zapret2/binaries/nfqws2
+        os.path.join(zdir,                  name),   # /opt/zapret2/nfqws2
+        os.path.join(zdir, "bin",           name),   # /opt/zapret2/bin/nfqws2
+        "/usr/local/bin/" + name,
+        "/usr/bin/" + name,
+    ]
     for c in candidates:
-        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+        if os.path.isfile(c):
             return c
 
-    # Рекурсивный поиск в zapret_dir (ищем исполняемый файл с нужным именем)
+    # Случай 3: рекурсивный glob (медленнее, но надёжно)
     try:
-        pattern = os.path.join(zdir, "**", binary)
-        for found in glob.glob(pattern, recursive=True):
-            if os.path.isfile(found) and os.access(found, os.X_OK):
-                # Пропускаем docs/ — там могут быть примеры
-                if "docs" not in found.split(os.sep):
-                    return found
+        for found in sorted(glob.glob(
+                os.path.join(zdir, "**", name), recursive=True)):
+            parts = found.split(os.sep)
+            if "docs" not in parts and os.path.isfile(found):
+                return found
     except Exception:
         pass
 
-    # PATH системы
-    return shutil.which(binary)
+    # Случай 4: PATH системы
+    return shutil.which(name)
 
 
-def find_binary_auto(zapret_dir: str) -> Optional[str]:
+def find_binary_auto(zapret_dir: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Автоопределение: ищет любой nfqws2 в zapret_dir и возвращает
-    путь + имя бинарника для сохранения в конфиг.
-    Возвращает (full_path, relative_or_name) или (None, None).
+    Автопоиск бинарника в zapret_dir.
+    Возвращает (full_path, full_path) — оба значения одинаковы,
+    чтобы cfg["binary"] = full_path и find_binary() сразу его нашёл.
     """
     for name in ("nfqws2", "winws2", "nfqws"):
         cfg = {"zapret_dir": zapret_dir, "binary": name}
         found = find_binary(cfg)
         if found:
-            return found, name
+            return found, found  # возвращаем полный путь в обоих полях
     return None, None
 
 
 def build_cmdline(cfg: dict, profile: dict, extra_flags: str = "") -> List[str]:
-    binary     = find_binary(cfg) or cfg.get("binary", "nfqws2")
-    zdir       = cfg.get("zapret_dir", "/opt/zapret2")
-    lua_lib    = os.path.join(zdir, cfg.get("lua_lib",    "lua/zapret-lib.lua"))
-    lua_antidpi= os.path.join(zdir, cfg.get("lua_antidpi","lua/zapret-antidpi.lua"))
+    binary      = find_binary(cfg) or cfg.get("binary", "nfqws2")
+    zdir        = cfg.get("zapret_dir", "/opt/zapret2")
+    lua_lib     = os.path.join(zdir, cfg.get("lua_lib",     "lua/zapret-lib.lua"))
+    lua_antidpi = os.path.join(zdir, cfg.get("lua_antidpi", "lua/zapret-antidpi.lua"))
 
-    cmd = [binary, f"--qnum={cfg.get('qnum','200')}"]
-    cmd += [f"--lua-init=@{lua_lib}", f"--lua-init=@{lua_antidpi}"]
+    cmd = [binary,
+           f"--qnum={cfg.get('qnum','200')}",
+           f"--lua-init=@{lua_lib}",
+           f"--lua-init=@{lua_antidpi}"]
 
     for li in profile.get("lua_init", []):
         cmd.append(f"--lua-init={li}")
@@ -89,8 +91,8 @@ def build_cmdline(cfg: dict, profile: dict, extra_flags: str = "") -> List[str]:
             if not os.path.isabs(he):
                 he = os.path.join(zdir, he)
             cmd.append(f"--hostlist-exclude={he}")
-        if p.get("out_range"): cmd.append(f"--out-range={p['out_range']}")
-        if p.get("in_range"):  cmd.append(f"--in-range={p['in_range']}")
+        if p.get("out_range"):  cmd.append(f"--out-range={p['out_range']}")
+        if p.get("in_range"):   cmd.append(f"--in-range={p['in_range']}")
         for payload in p.get("payloads", []):
             cmd.append(f"--payload={payload}")
         for ds in p.get("desync", []):

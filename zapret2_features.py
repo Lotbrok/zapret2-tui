@@ -17,7 +17,7 @@ from typing import List, Dict, Optional, Callable, Tuple
 
 HERE          = os.path.dirname(os.path.abspath(__file__))
 HOSTLISTS_DIR = os.path.join(HERE, "hostlists")
-FEATURES_CFG  = os.path.expanduser("~/.zapret2-features.json")
+FEATURES_CFG  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zapret2-features.json")
 SYSTEMD_UNIT  = "/etc/systemd/system/zapret2.service"
 
 DEFAULT_FEATURES = {

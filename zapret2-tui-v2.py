@@ -29,7 +29,8 @@ from zapret2_ai import StrategyFinder, test_api_key, guess_service, normalize_do
 #  CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
 
-CONFIG_FILE = os.path.expanduser("~/.zapret2-tui.json")
+# Конфиг хранится рядом со скриптом — работает одинаково для любого пользователя
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zapret2-tui.json")
 
 DEFAULT_CONFIG = {
     "zapret_dir":  "/opt/zapret2",
@@ -295,22 +296,45 @@ class ZapretTUI:
 
     def _auto_detect_binary(self):
         """
-        Если бинарник не найден по текущим настройкам —
-        автоматически ищет его в zapret_dir и обновляет конфиг.
+        Ищет бинарник и сохраняет ПОЛНЫЙ ПУТЬ в cfg["binary"].
+        Безопасен для вызова до инициализации curses.
         """
-        from zapret2_tui_helpers import find_binary, find_binary_auto
-        if find_binary(self.cfg):
-            return  # уже найден — ничего не делаем
+        from zapret2_tui_helpers import find_binary
+        import glob
 
-        # Пробуем найти автоматически
-        full_path, name = find_binary_auto(self.cfg["zapret_dir"])
-        if full_path:
-            self.cfg["binary"] = name
-            save_config(self.cfg)
-            self.add_log(f"[CFG] Бинарник найден автоматически: {full_path}")
-        else:
-            self.add_log(f"[CFG] Бинарник не найден в {self.cfg['zapret_dir']}")
-            self.add_log("[CFG] Укажите путь вручную: меню 6 → Настройки")
+        zdir = self.cfg.get("zapret_dir", "/opt/zapret2")
+
+        # Прямой поиск по всем известным путям
+        for name in ("nfqws2", "winws2", "nfqws"):
+            candidates = [
+                os.path.join(zdir, "nfq2",          name),
+                os.path.join(zdir, "binaries", "my", name),
+                os.path.join(zdir, "binaries",       name),
+                os.path.join(zdir,                   name),
+                os.path.join(zdir, "bin",            name),
+                "/usr/local/bin/" + name,
+                "/usr/bin/" + name,
+            ]
+            for path in candidates:
+                if os.path.isfile(path):
+                    self.cfg["binary"] = path   # полный путь!
+                    save_config(self.cfg)
+                    self.add_log(f"[CFG] Бинарник найден: {path}")
+                    return
+
+            # Рекурсивный glob
+            try:
+                for found in sorted(glob.glob(
+                        os.path.join(zdir, "**", name), recursive=True)):
+                    if os.path.isfile(found) and "docs" not in found.split(os.sep):
+                        self.cfg["binary"] = found
+                        save_config(self.cfg)
+                        self.add_log(f"[CFG] Бинарник найден (glob): {found}")
+                        return
+            except Exception:
+                pass
+
+        self.add_log("[CFG] Бинарник не найден — укажите вручную в меню 6 → Настройки → Бинарник")
 
     def _on_new_profile(self, profile):
         self.cfg.setdefault("profiles", []).append(profile)
@@ -441,31 +465,61 @@ class ZapretTUI:
             elif k==27:
                 del win; self.scr.touchwin(); self.scr.refresh(); return False
 
-    def menu(self, items, title="", y_off=2, x_off=2, height=None, width=None) -> int:
+    def menu(self, items, title="", y_off=None, x_off=None, height=None, width=None) -> int:
+        """Меню с автоцентрированием и поддержкой Page Up/Down."""
         h, w = self.scr.getmaxyx()
-        mw = min((width or max((len(i) for i in items), default=10)+4), w-x_off-2)
-        mh = min((height or len(items)+2), h-y_off-2)
+        # Размер окна
+        want_w = max((len(i) for i in items), default=10) + 6
+        want_h = len(items) + 2
+        mw = min(width  or want_w, w - 4)
+        mh = min(height or want_h, h - 4)
+        # Центрируем если координаты не заданы явно
+        if y_off is None: y_off = max(1, (h - mh) // 2)
+        if x_off is None: x_off = max(1, (w - mw) // 2)
+        # Защита от выхода за границы
+        y_off = max(0, min(y_off, h - mh - 1))
+        x_off = max(0, min(x_off, w - mw - 1))
         win = curses.newwin(mh, mw, y_off, x_off)
-        win.bkgd(' ', curses.color_pair(C_MENU)); self.border_box(win, title)
-        sel=0; scroll=0; vis=mh-2
+        win.bkgd(' ', curses.color_pair(C_MENU))
+        win.keypad(True)
+        self.border_box(win, title)
+        sel = 0; scroll = 0; vis = mh - 2
         while True:
             for i in range(vis):
-                idx=i+scroll
-                if idx>=len(items): break
-                lbl = items[idx][:mw-4]
-                a = (curses.color_pair(C_SEL)|curses.A_BOLD) if idx==sel else curses.color_pair(C_MENU)
-                try: win.addstr(i+1, 2, f" {lbl:<{mw-4}} ", a)
+                idx = i + scroll
+                if idx >= len(items): break
+                lbl = items[idx][:mw - 4]
+                a = (curses.color_pair(C_SEL) | curses.A_BOLD) if idx == sel else curses.color_pair(C_MENU)
+                try: win.addstr(i + 1, 2, f" {lbl:<{mw-4}} ", a)
                 except curses.error: pass
-            win.refresh(); k=win.getch()
-            if k==curses.KEY_UP:
-                sel=max(0,sel-1)
-                if sel<scroll: scroll=sel
-            elif k==curses.KEY_DOWN:
-                sel=min(len(items)-1,sel+1)
-                if sel>=scroll+vis: scroll=sel-vis+1
-            elif k in (10,13):
+            # Индикатор прокрутки
+            if len(items) > vis:
+                try:
+                    pct = scroll * (mh - 4) // max(1, len(items) - vis)
+                    win.addstr(1 + pct, mw - 1, "█", curses.color_pair(C_BORDER))
+                except curses.error: pass
+            win.refresh()
+            k = win.getch()
+            if k in (curses.KEY_UP, ord('k')):
+                sel = max(0, sel - 1)
+                if sel < scroll: scroll = sel
+            elif k in (curses.KEY_DOWN, ord('j')):
+                sel = min(len(items) - 1, sel + 1)
+                if sel >= scroll + vis: scroll = sel - vis + 1
+            elif k == curses.KEY_PPAGE:
+                sel = max(0, sel - vis)
+                scroll = max(0, scroll - vis)
+            elif k == curses.KEY_NPAGE:
+                sel = min(len(items) - 1, sel + vis)
+                if sel >= scroll + vis: scroll = sel - vis + 1
+            elif k == curses.KEY_HOME:
+                sel = 0; scroll = 0
+            elif k == curses.KEY_END:
+                sel = len(items) - 1
+                scroll = max(0, sel - vis + 1)
+            elif k in (10, 13, curses.KEY_ENTER):
                 del win; self.scr.touchwin(); self.scr.refresh(); return sel
-            elif k==27:
+            elif k == 27:
                 del win; self.scr.touchwin(); self.scr.refresh(); return -1
         del win; self.scr.touchwin(); self.scr.refresh(); return -1
 
@@ -1100,10 +1154,12 @@ class ZapretTUI:
                 val = mask_key(key) if key else "(не задан)"
                 items.append(f"  {info['name']:<26} {val}")
 
-            items += ["  Проверить бинарник", "  Проверить безопасность .env", "← Назад"]
+            items += ["  🔍 Найти бинарник автоматически",
+                      "  Проверить бинарник",
+                      "  Проверить безопасность .env",
+                      "← Назад"]
             h, w = self.scr.getmaxyx()
-            idx = self.menu(items, "Настройки", y_off=2, x_off=2,
-                            height=min(len(items)+2, h-4), width=min(w-4, 68))
+            idx = self.menu(items, "Настройки — ↑↓ выбор  Enter подтвердить  Esc назад")
             total = len(zap_fields) + 1 + len(AI_PROVIDERS)
             if idx == -1 or idx == len(items)-1:
                 save_config(self.cfg); break
@@ -1115,8 +1171,24 @@ class ZapretTUI:
                 else:
                     self.msgbox("✓ .env файл защищён\n✓ .gitignore настроен", "Безопасность OK")
             elif idx == len(items)-3:
+                # Проверить бинарник
                 b = find_binary(self.cfg)
-                self.msgbox(f"Бинарник: {b or 'НЕ НАЙДЕН'}", "Проверка")
+                self.msgbox(f"Бинарник: {b or 'НЕ НАЙДЕН'}\n\nПуть в конфиге: {self.cfg.get('binary','?')}", "Проверка")
+            elif idx == len(items)-4:
+                # Найти бинарник автоматически
+                old_b = self.cfg.get("binary","")
+                self._auto_detect_binary()
+                new_b = self.cfg.get("binary","")
+                found = find_binary(self.cfg)
+                if found:
+                    self.msgbox(f"✓ Найден:\n{found}\n\nСохранено в конфиг.", "Автопоиск")
+                else:
+                    self.msgbox(
+                        f"Не найден автоматически.\n\n"
+                        f"Введите путь вручную в поле 'Бинарник'.\n"
+                        f"Например: /opt/zapret2/nfq2/nfqws2",
+                        "Автопоиск"
+                    )
             elif idx < len(zap_fields):
                 k, lbl = zap_fields[idx]
                 v = self.inputbox(lbl, str(self.cfg.get(k,"")), lbl)

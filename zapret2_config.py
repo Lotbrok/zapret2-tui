@@ -16,7 +16,8 @@ from typing import Optional, Dict
 # Путь к .env — ищем рядом с этим файлом
 _HERE = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(_HERE, ".env")
-CONFIG_FILE = os.path.expanduser("~/.zapret2-tui.json")
+# Конфиг рядом со скриптом — не зависит от sudo/пользователя
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zapret2-tui.json")
 
 # ── Поддерживаемые провайдеры ─────────────────────────────────────────────────
 
