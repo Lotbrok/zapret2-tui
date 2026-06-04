@@ -1140,81 +1140,121 @@ class ZapretTUI:
 
     # ── Главный экран ─────────────────────────────────────────────────────────
     def draw_main(self):
-        self.scr.clear(); h,w=self.scr.getmaxyx()
-        self.draw_title()
-        pw=min(34,w//3); ph=h-3
+        h, w = self.scr.getmaxyx()
+        pw = min(34, w // 3); ph = h - 3
 
-        mw=curses.newwin(ph,pw,1,0); mw.bkgd(' ',curses.color_pair(C_MENU))
-        self.border_box(mw,"Меню")
-        items=[("1","Быстрый старт"),("2","Мои профили"),
-               ("3","🤖 AI подбор стратегии"),("4","🔀 Смешать профили"),
-               ("5","Предпросмотр команды"),("6","Настройки"),
-               ("7","blockcheck2"),
-               ("8","📋 Хостлисты"),
-               ("9","📊 Мониторинг"),
-               ("W","⚙  Watchdog"),
-               ("A","🚀 Автозапуск"),
-               ("U","🔄 Автообновление"),
-               ("L","Лог"),("S","Стоп"),("Q","Выход")]
-        for i,(k,lbl) in enumerate(items):
-            try:
-                mw.addstr(i+2,2,f" {k} ",curses.color_pair(C_KEY)|curses.A_BOLD)
-                mw.addstr(i+2,6,lbl,curses.color_pair(C_MENU))
-            except curses.error: pass
-        mw.refresh()
+        # Создаём окна один раз и кешируем
+        if not hasattr(self, '_mw') or self._main_size != (h, w):
+            self._main_size = (h, w)
+            self._mw = curses.newwin(ph, pw, 1, 0)
+            self._iw = curses.newwin(ph, w - pw - 1, 1, pw + 1)
 
-        iw_x=pw+1; iw_w=w-pw-1
-        iw=curses.newwin(ph,iw_w,1,iw_x); iw.bkgd(' ',curses.color_pair(C_MENU))
-        self.border_box(iw,"Статус")
+        mw = self._mw
+        iw = self._iw
+        iw_w = w - pw - 1
 
-        running=self.proc and self.proc.poll() is None
-        stxt="▶ ЗАПУЩЕН" if running else "■ СТОП"
-        sa=(curses.color_pair(C_OK)|curses.A_BOLD) if running else curses.color_pair(C_WARN)
+        # ── Заголовок ────────────────────────────────────────────────────────
+        title = " zapret2-tui v2  [AI стратегии] "
         try:
-            iw.addstr(2,3,"Статус: ",curses.color_pair(C_KEY))
-            iw.addstr(2,11,stxt,sa)
-            if running: iw.addstr(2,11+len(stxt)+1,f"PID={self.proc.pid}",curses.color_pair(C_DIM))
+            self.scr.addnstr(0, 0, title.center(w), w - 1,
+                             curses.color_pair(C_TITLE) | curses.A_BOLD)
         except curses.error: pass
 
-        # AI статус
-        if self.ai_finder and not self._ai_done:
-            msg,cur,tot=self.ai_progress
+        # ── Меню ─────────────────────────────────────────────────────────────
+        mw.erase()
+        mw.bkgd(' ', curses.color_pair(C_MENU))
+        self.border_box(mw, "Меню")
+        items = [("1","Быстрый старт"), ("2","Мои профили"),
+                 ("3","AI подбор стратегии"), ("4","Смешать профили"),
+                 ("5","Предпросмотр команды"), ("6","Настройки"),
+                 ("7","blockcheck2"),
+                 ("8","Хостлисты"),
+                 ("9","Мониторинг"),
+                 ("W","Watchdog"),
+                 ("A","Автозапуск"),
+                 ("U","Автообновление"),
+                 ("L","Лог"), ("S","Стоп"), ("Q","Выход")]
+        for i, (k, lbl) in enumerate(items):
+            if i + 2 >= ph - 1: break
             try:
-                iw.addstr(3,3,"🤖 AI: ",curses.color_pair(C_AI)|curses.A_BOLD)
-                iw.addstr(3,10,f"{msg[:iw_w-12]}",curses.color_pair(C_AI))
+                mw.addstr(i + 2, 2, f" {k} ", curses.color_pair(C_KEY) | curses.A_BOLD)
+                mw.addstr(i + 2, 6, lbl[:pw - 8], curses.color_pair(C_MENU))
             except curses.error: pass
 
-        b=find_binary(self.cfg)
+        # ── Статус панель ────────────────────────────────────────────────────
+        iw.erase()
+        iw.bkgd(' ', curses.color_pair(C_MENU))
+        self.border_box(iw, "Статус")
+
+        running = self.proc and self.proc.poll() is None
+        stxt = "▶ ЗАПУЩЕН" if running else "■ СТОП"
+        sa = (curses.color_pair(C_OK) | curses.A_BOLD) if running else curses.color_pair(C_WARN)
+        try:
+            iw.addstr(2, 3, "Статус: ", curses.color_pair(C_KEY))
+            iw.addstr(2, 11, stxt, sa)
+            if running:
+                iw.addstr(2, 11 + len(stxt) + 1,
+                          f"PID={self.proc.pid}"[:iw_w - 16],
+                          curses.color_pair(C_DIM))
+        except curses.error: pass
+
+        if self.ai_finder and not self._ai_done:
+            msg, cur, tot = self.ai_progress
+            try:
+                iw.addstr(3, 3, "AI: ", curses.color_pair(C_AI) | curses.A_BOLD)
+                iw.addstr(3, 7, msg[:iw_w - 9], curses.color_pair(C_AI))
+            except curses.error: pass
+
+        b = find_binary(self.cfg)
         provider = get_active_provider(self.cfg)
         pname    = AI_PROVIDERS.get(provider, {}).get("name", provider)
         has_key  = bool(get_api_key(provider, self.cfg))
+        wd_on    = self.feat.get("watchdog_enabled", False)
+        au_on    = self.feat.get("autoupdate_enabled", False)
+        as_on    = self.feat.get("autostart_enabled", False)
         try:
-            iw.addstr(5,3,"Бинарник:",curses.color_pair(C_KEY))
-            iw.addstr(5,13,(b or "НЕ НАЙДЕН")[:iw_w-15],
+            iw.addstr(5, 3, "Бинарник:  ", curses.color_pair(C_KEY))
+            iw.addstr(5, 14, (b or "НЕ НАЙДЕН")[:iw_w - 16],
                       curses.color_pair(C_OK) if b else curses.color_pair(C_WARN))
-            iw.addstr(7,3,"Директория:",curses.color_pair(C_KEY))
-            iw.addstr(7,15,self.cfg["zapret_dir"][:iw_w-17],curses.color_pair(C_DIM))
-            iw.addstr(9,3,"Профилей:",curses.color_pair(C_KEY))
-            iw.addstr(9,13,str(len(self.cfg.get("profiles",[]))),curses.color_pair(C_DIM))
-            iw.addstr(11,3,"AI:",curses.color_pair(C_KEY))
-            ai_status = f"{pname}  {'✓ ключ есть' if has_key else '✗ ключ не задан'}"
-            iw.addstr(11,7,ai_status[:iw_w-9],
+            iw.addstr(6, 3, "Директория:", curses.color_pair(C_KEY))
+            iw.addstr(6, 15, self.cfg["zapret_dir"][:iw_w - 17], curses.color_pair(C_DIM))
+            iw.addstr(7, 3, "Профилей:  ", curses.color_pair(C_KEY))
+            iw.addstr(7, 14, str(len(self.cfg.get("profiles", []))), curses.color_pair(C_DIM))
+            iw.addstr(8, 3, "AI:        ", curses.color_pair(C_KEY))
+            ai_s = f"{pname}  {'[ключ OK]' if has_key else '[нет ключа]'}"
+            iw.addstr(8, 14, ai_s[:iw_w - 16],
                       curses.color_pair(C_OK) if has_key else curses.color_pair(C_WARN))
+            # Статусы фоновых сервисов
+            iw.addstr(10, 3, "Watchdog:  ", curses.color_pair(C_KEY))
+            iw.addstr(10, 14, "ВКЛ" if wd_on else "выкл",
+                      curses.color_pair(C_OK) if wd_on else curses.color_pair(C_DIM))
+            iw.addstr(11, 3, "Автозапуск:", curses.color_pair(C_KEY))
+            iw.addstr(11, 14, "ВКЛ" if as_on else "выкл",
+                      curses.color_pair(C_OK) if as_on else curses.color_pair(C_DIM))
+            iw.addstr(12, 3, "Автообновл:", curses.color_pair(C_KEY))
+            iw.addstr(12, 14, "ВКЛ" if au_on else "выкл",
+                      curses.color_pair(C_OK) if au_on else curses.color_pair(C_DIM))
         except curses.error: pass
 
         # Лог превью
-        try: iw.addstr(13,3,"Последний лог:",curses.color_pair(C_KEY))
+        try: iw.addstr(14, 3, "Лог:", curses.color_pair(C_KEY))
         except curses.error: pass
-        for i,ln in enumerate(self.log_lines[-(ph-16):]):
-            if 14+i>=ph-1: break
-            if "[AI]" in ln: a=curses.color_pair(C_AI)
-            elif "✓" in ln:  a=curses.color_pair(C_OK)
-            elif "✗" in ln or "ОШИБК" in ln.upper(): a=curses.color_pair(C_WARN)
-            else: a=curses.color_pair(C_DIM)
-            try: iw.addstr(14+i,3,ln[:iw_w-5],a)
+        for i, ln in enumerate(self.log_lines[-(ph - 17):]):
+            if 15 + i >= ph - 1: break
+            if "[AI]" in ln:              a = curses.color_pair(C_AI)
+            elif "✓" in ln:              a = curses.color_pair(C_OK)
+            elif "✗" in ln or "ОШИБК" in ln.upper(): a = curses.color_pair(C_WARN)
+            else:                         a = curses.color_pair(C_DIM)
+            try: iw.addstr(15 + i, 3, ln[:iw_w - 5], a)
             except curses.error: pass
-        iw.refresh()
+
+        # Статусбар
         self.draw_statusbar()
+
+        # Единый flush — исключает мигание
+        mw.noutrefresh()
+        iw.noutrefresh()
+        curses.doupdate()
 
 
     # ══════════════════════════════════════════════════════════════════════════
