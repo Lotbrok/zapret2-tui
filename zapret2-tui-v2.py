@@ -31,6 +31,7 @@ from zapret2_ai import StrategyFinder, test_api_key, guess_service, normalize_do
 
 # Конфиг хранится рядом со скриптом — работает одинаково для любого пользователя
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zapret2-tui.json")
+PID_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zapret2-tui.pid")
 
 DEFAULT_CONFIG = {
     "zapret_dir":  "/opt/zapret2",
@@ -231,6 +232,41 @@ def init_colors():
 #  MAIN TUI CLASS
 # ──────────────────────────────────────────────────────────────────────────────
 
+class _ProcHandle:
+    """
+    Обёртка вокруг уже запущенного процесса (по PID).
+    Имитирует интерфейс subprocess.Popen для совместимости с остальным кодом.
+    """
+    def __init__(self, pid: int):
+        self.pid    = pid
+        self.stdout = None   # stdout недоступен для уже запущенного процесса
+
+    def poll(self):
+        """None = процесс жив, число = код возврата."""
+        try:
+            os.kill(self.pid, 0)
+            return None   # жив
+        except (ProcessLookupError, OSError):
+            return -1     # умер
+
+    def terminate(self):
+        try: os.kill(self.pid, 15)   # SIGTERM
+        except Exception: pass
+
+    def kill(self):
+        try: os.kill(self.pid, 9)    # SIGKILL
+        except Exception: pass
+
+    def wait(self, timeout=None):
+        import time
+        deadline = time.time() + (timeout or 5)
+        while time.time() < deadline:
+            if self.poll() is not None:
+                return
+            time.sleep(0.1)
+
+
+
 class ZapretTUI:
     def __init__(self, scr):
         self.scr = scr
@@ -272,6 +308,8 @@ class ZapretTUI:
         self.main_loop()
 
     def _start_bg(self):
+        # Восстановить подключение к уже запущенному процессу zapret
+        self._restore_proc()
         monitor_hl = self.hlm.get_monitor_hostlist()
         domains = self.hlm.read_domains(monitor_hl)
         if domains:
@@ -281,6 +319,41 @@ class ZapretTUI:
             self.watchdog.start()
         if self.feat.get("autoupdate_enabled"):
             self.updater.start()
+
+    def _restore_proc(self):
+        """При старте TUI проверяем — вдруг zapret уже запущен от прошлой сессии."""
+        try:
+            if not os.path.isfile(PID_FILE):
+                return
+            data = json.load(open(PID_FILE))
+            pid  = int(data.get("pid", 0))
+            name = data.get("profile_name", "")
+            if pid <= 0:
+                return
+            # Проверяем что процесс живёт
+            os.kill(pid, 0)   # signal 0 = просто проверка, не убивает
+            # Переподключаемся: создаём Popen-обёртку без запуска нового процесса
+            self.proc = _ProcHandle(pid)
+            self.status_msg = name
+            self.add_log(f"[CFG] Восстановлено подключение к PID={pid} ({name})")
+        except (ProcessLookupError, PermissionError):
+            # Процесс умер пока нас не было — чистим PID файл
+            try: os.unlink(PID_FILE)
+            except Exception: pass
+        except Exception:
+            pass
+
+    def _save_pid(self, pid: int, profile_name: str):
+        """Сохраняем PID в файл чтобы следующий запуск TUI мог переподключиться."""
+        try:
+            json.dump({"pid": pid, "profile_name": profile_name},
+                      open(PID_FILE, "w"))
+        except Exception:
+            pass
+
+    def _clear_pid(self):
+        try: os.unlink(PID_FILE)
+        except Exception: pass
 
     def _watchdog_switch(self):
         profiles = self.cfg.get("profiles", [])
@@ -406,7 +479,9 @@ class ZapretTUI:
         try: win.addstr(bh-1, (bw-10)//2, " [ OK ] ", curses.color_pair(C_KEY))
         except curses.error: pass
         win.refresh()
-        while win.getch() not in (10,13,27,ord('q')): pass
+        while win.getch() not in (10,13,27,ord('q'),
+                                  curses.KEY_LEFT,curses.KEY_RIGHT,
+                                  curses.KEY_ENTER): pass
         del win; self.scr.touchwin(); self.scr.refresh()
 
     def inputbox(self, prompt, default="", title="Ввод") -> Optional[str]:
@@ -459,8 +534,14 @@ class ZapretTUI:
                 try: win.addstr(bh-2, 4+i*10, lbl, a)
                 except curses.error: pass
             win.refresh(); k = win.getch()
-            if k in (curses.KEY_LEFT, curses.KEY_RIGHT, 9): sel=1-sel
-            elif k in (10,13):
+            if k in (curses.KEY_UP, curses.KEY_DOWN, 9): sel=1-sel
+            elif k == curses.KEY_RIGHT:
+                # Стрелка вправо = выбрать "ДА" (sel=0) и подтвердить
+                del win; self.scr.touchwin(); self.scr.refresh(); return True
+            elif k == curses.KEY_LEFT:
+                # Стрелка влево = "НЕТ" / назад
+                del win; self.scr.touchwin(); self.scr.refresh(); return False
+            elif k in (10,13,curses.KEY_ENTER):
                 del win; self.scr.touchwin(); self.scr.refresh(); return sel==0
             elif k==27:
                 del win; self.scr.touchwin(); self.scr.refresh(); return False
@@ -517,9 +598,9 @@ class ZapretTUI:
             elif k == curses.KEY_END:
                 sel = len(items) - 1
                 scroll = max(0, sel - vis + 1)
-            elif k in (10, 13, curses.KEY_ENTER):
+            elif k in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT):
                 del win; self.scr.touchwin(); self.scr.refresh(); return sel
-            elif k == 27:
+            elif k in (27, curses.KEY_LEFT):
                 del win; self.scr.touchwin(); self.scr.refresh(); return -1
         del win; self.scr.touchwin(); self.scr.refresh(); return -1
 
@@ -561,10 +642,18 @@ class ZapretTUI:
         self.add_log("Запуск: " + " ".join(shlex.quote(a) for a in cmd[:8]) + "…")
         try:
             self.proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1)
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                # start_new_session=True отвязывает процесс от терминала:
+                # zapret продолжит работать после выхода из TUI
+                start_new_session=True,
+            )
             self.add_log(f"Запущен PID={self.proc.pid}")
             self.status_msg = profile.get("name","(без имени)")
+            self._save_pid(self.proc.pid, self.status_msg)
         except PermissionError:
             self.msgbox("Нет прав root/sudo.","Ошибка")
         except FileNotFoundError:
@@ -583,6 +672,7 @@ class ZapretTUI:
         except Exception as e:
             self.add_log(f"Ошибка стопа: {e}")
         self.proc=None; self.status_msg=""
+        self._clear_pid()
 
     def poll_proc(self):
         if not self.proc: return
@@ -1346,8 +1436,9 @@ class ZapretTUI:
             try: iw.addstr(15 + i, 3, ln[:iw_w - 5], a)
             except curses.error: pass
 
-        # Статусбар
+        # Статусбар и командная строка
         self.draw_statusbar()
+        self._draw_cmdline()
 
         # Единый flush — исключает мигание
         mw.noutrefresh()
@@ -1849,6 +1940,89 @@ class ZapretTUI:
                     self.msgbox("Обновление запущено в фоне.\nРезультаты появятся в Профилях и Логе.", "Запущено")
 
 
+    # ── Встроенная командная строка ──────────────────────────────────────────────
+
+    def _draw_cmdline(self):
+        """Рисует строку ввода команд в предпоследней строке экрана."""
+        h, w = self.scr.getmaxyx()
+        row = h - 2
+        buf = getattr(self, '_cmd_buf', '')
+        prefix = " $ "
+        try:
+            self.scr.addstr(row, 0, (prefix + buf).ljust(w - 1)[:w-1],
+                            curses.color_pair(C_STATUS) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+    def _handle_cmdline_key(self, k) -> bool:
+        """
+        Обрабатывает нажатие клавиши в режиме командной строки.
+        Возвращает True если клавиша была обработана (не нужно передавать дальше).
+        """
+        if not hasattr(self, '_cmd_buf'):
+            self._cmd_buf = ''
+        if not hasattr(self, '_cmd_history'):
+            self._cmd_history = []
+        if not hasattr(self, '_cmd_hist_pos'):
+            self._cmd_hist_pos = -1
+
+        # Активация командной строки любым печатным символом когда буфер пуст
+        # осуществляется из main_loop — здесь обрабатываем когда уже в режиме ввода
+
+        if k in (curses.KEY_BACKSPACE, 127, 8):
+            self._cmd_buf = self._cmd_buf[:-1]
+            return True
+        elif k == 27:   # Esc — очистить буфер
+            self._cmd_buf = ''
+            self._cmd_hist_pos = -1
+            return True
+        elif k in (10, 13, curses.KEY_ENTER):
+            cmd = self._cmd_buf.strip()
+            self._cmd_buf = ''
+            self._cmd_hist_pos = -1
+            if cmd:
+                self._cmd_history.append(cmd)
+                self._run_shell_cmd(cmd)
+            return True
+        elif k == curses.KEY_UP:
+            if self._cmd_history:
+                self._cmd_hist_pos = min(
+                    self._cmd_hist_pos + 1, len(self._cmd_history) - 1)
+                self._cmd_buf = self._cmd_history[
+                    -(self._cmd_hist_pos + 1)]
+            return True
+        elif k == curses.KEY_DOWN:
+            if self._cmd_hist_pos > 0:
+                self._cmd_hist_pos -= 1
+                self._cmd_buf = self._cmd_history[
+                    -(self._cmd_hist_pos + 1)]
+            else:
+                self._cmd_hist_pos = -1
+                self._cmd_buf = ''
+            return True
+        elif 32 <= k < 256:
+            self._cmd_buf += chr(k)
+            return True
+        return False
+
+    def _run_shell_cmd(self, cmd: str):
+        """Выполняет shell-команду и пишет вывод в лог."""
+        self.add_log(f"[CMD] $ {cmd}")
+        try:
+            result = subprocess.run(
+                cmd, shell=True,
+                capture_output=True, text=True, timeout=15)
+            for line in (result.stdout + result.stderr).splitlines():
+                if line.strip():
+                    self.add_log(f"[CMD] {line}")
+            if result.returncode != 0:
+                self.add_log(f"[CMD] код возврата: {result.returncode}")
+        except subprocess.TimeoutExpired:
+            self.add_log("[CMD] Превышено время ожидания (15с)")
+        except Exception as e:
+            self.add_log(f"[CMD] Ошибка: {e}")
+
+
     # ── Главный цикл ─────────────────────────────────────────────────────────
     def main_loop(self):
         while True:
@@ -1865,14 +2039,26 @@ class ZapretTUI:
             self.scr.timeout(300)
             k=self.scr.getch()
 
+            # Если есть буфер команды — передаём клавишу в обработчик командной строки
+            # (кроме управляющих клавиш меню)
+            if hasattr(self,'_cmd_buf') and self._cmd_buf:
+                if self._handle_cmdline_key(k):
+                    continue
+
             if k in (ord('q'),ord('Q')):
-                if self.proc and self.proc.poll() is None:
-                    if self.confirm("zapret2 запущен. Остановить перед выходом?"):
-                        self.stop_zapret()
-                if self.ai_finder and not self._ai_done:
-                    if self.confirm("AI подбор идёт. Остановить?"):
-                        self.ai_finder.stop()
-                break
+                # Q только если командная строка пустая
+                if not getattr(self,'_cmd_buf',''):
+                    do_exit = True
+                    if self.proc and self.proc.poll() is None:
+                        ans = self.confirm("zapret2 запущен. Остановить при выходе?")
+                        if ans:
+                            self.stop_zapret()
+                    if self.ai_finder and not self._ai_done:
+                        if self.confirm("AI подбор идёт. Остановить?"):
+                            self.ai_finder.stop()
+                    break
+                else:
+                    self._handle_cmdline_key(k)
             elif k==ord('1'): self.quick_start()
             elif k==ord('2'): self.profiles_menu()
             elif k==ord('3'): self.ai_strategy_menu()
@@ -1890,13 +2076,27 @@ class ZapretTUI:
                 if self.proc and self.proc.poll() is None:
                     if self.confirm("Остановить zapret2?"): self.stop_zapret()
                 else: self.status_msg="Процесс не запущен"
+            elif k == ord('/'):
+                # / — активировать командную строку явно (как в vim)
+                if not hasattr(self,'_cmd_buf'): self._cmd_buf = ''
+            elif k in (curses.KEY_BACKSPACE, 127, 8, 27) and hasattr(self,'_cmd_buf'):
+                self._handle_cmdline_key(k)
+            elif 32 <= k < 256:
+                # Любой печатный символ не занятый меню — идёт в командную строку
+                menu_keys = set(b'123456789qQwWaAuUsSlL')
+                if k not in menu_keys:
+                    if not hasattr(self,'_cmd_buf'): self._cmd_buf = ''
+                    self._handle_cmdline_key(k)
 
-        self.stop_zapret()
+        # Останавливаем фоновые сервисы TUI, но НЕ трогаем zapret-процесс
+        # если он был запущен с start_new_session=True — он продолжит работать
         self.monitor.stop()
         self.watchdog.stop()
         self.updater.stop()
         if self.ai_finder and not self._ai_done:
             self.ai_finder.stop()
+        # self.proc намеренно НЕ останавливаем здесь —
+        # пользователь уже ответил на вопрос выше
 
 # ──────────────────────────────────────────────────────────────────────────────
 
