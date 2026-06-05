@@ -1351,8 +1351,8 @@ class ZapretTUI:
         # ── Меню ─────────────────────────────────────────────────────────────
         mw.erase()
         mw.bkgd(' ', curses.color_pair(C_MENU))
-        self.border_box(mw, "Меню")
-        items = [("1","Быстрый старт"), ("2","Мои профили"),
+        self.border_box(mw, "Меню  ↑↓ выбор  Enter запустить")
+        self._main_items = [("1","Быстрый старт"), ("2","Мои профили"),
                  ("3","AI подбор стратегии"), ("4","Смешать профили"),
                  ("5","Предпросмотр команды"), ("6","Настройки"),
                  ("7","blockcheck2"),
@@ -1362,11 +1362,16 @@ class ZapretTUI:
                  ("A","Автозапуск"),
                  ("U","Автообновление"),
                  ("L","Лог"), ("S","Стоп"), ("Q","Выход")]
-        for i, (k, lbl) in enumerate(items):
+        if not hasattr(self, '_main_sel'): self._main_sel = 0
+        for i, (k, lbl) in enumerate(self._main_items):
             if i + 2 >= ph - 1: break
+            selected = (i == self._main_sel)
+            row_attr = (curses.color_pair(C_SEL) | curses.A_BOLD) if selected else curses.color_pair(C_MENU)
+            key_attr = (curses.color_pair(C_SEL) | curses.A_BOLD) if selected else (curses.color_pair(C_KEY) | curses.A_BOLD)
             try:
-                mw.addstr(i + 2, 2, f" {k} ", curses.color_pair(C_KEY) | curses.A_BOLD)
-                mw.addstr(i + 2, 6, lbl[:pw - 8], curses.color_pair(C_MENU))
+                mw.addstr(i + 2, 1, f" {k} {lbl[:pw-7]:<{pw-7}} ", row_attr if selected else curses.color_pair(C_MENU))
+                mw.addstr(i + 2, 2, f" {k} ", key_attr)
+                mw.addstr(i + 2, 6, lbl[:pw - 8], row_attr)
             except curses.error: pass
 
         # ── Статус панель ────────────────────────────────────────────────────
@@ -1436,8 +1441,7 @@ class ZapretTUI:
             try: iw.addstr(15 + i, 3, ln[:iw_w - 5], a)
             except curses.error: pass
 
-        # Статусбар и командная строка
-        self.draw_statusbar()
+        # Нижняя строка — командная строка (заменяет статусбар)
         self._draw_cmdline()
 
         # Единый flush — исключает мигание
@@ -1943,14 +1947,40 @@ class ZapretTUI:
     # ── Встроенная командная строка ──────────────────────────────────────────────
 
     def _draw_cmdline(self):
-        """Рисует строку ввода команд в предпоследней строке экрана."""
+        """
+        Нижняя строка экрана:
+        - Обычный режим: статус zapret + подсказка ~ для командной строки
+        - Режим ввода:   $ курсор ввода команды
+        """
         h, w = self.scr.getmaxyx()
-        row = h - 2
-        buf = getattr(self, '_cmd_buf', '')
-        prefix = " $ "
+        row = h - 1
+        cmd_mode = getattr(self, '_cmd_mode', False)
+        buf      = getattr(self, '_cmd_buf', '')
+        running  = self.proc and self.proc.poll() is None
+
+        if cmd_mode:
+            # Режим ввода команды
+            line = f" $ {buf}_"
+            attr = curses.color_pair(C_OK) | curses.A_BOLD
+        else:
+            # Статусная строка с подсказкой
+            if running:
+                status = f"▶ ЗАПУЩЕН  PID={self.proc.pid}  {self.status_msg}"
+                attr   = curses.color_pair(C_OK) | curses.A_BOLD
+            elif self.ai_finder and not self._ai_done:
+                msg, cur, tot = self.ai_progress
+                status = f"AI: {msg[:40]}  [{cur}/{tot}]"
+                attr   = curses.color_pair(C_AI) | curses.A_BOLD
+            else:
+                status = f"■ СТОП  {self.status_msg}"
+                attr   = curses.color_pair(C_STATUS)
+            hint = "  [~ = команда]"
+            line = f" {status}"
+            # Подсказка справа
+            if len(line) + len(hint) < w:
+                line = line + " " * (w - len(line) - len(hint) - 1) + hint
         try:
-            self.scr.addstr(row, 0, (prefix + buf).ljust(w - 1)[:w-1],
-                            curses.color_pair(C_STATUS) | curses.A_BOLD)
+            self.scr.addstr(row, 0, line[:w-1].ljust(w-1), attr)
         except curses.error:
             pass
 
@@ -2037,56 +2067,68 @@ class ZapretTUI:
 
             self.draw_main()
             self.scr.timeout(300)
-            k=self.scr.getch()
+            k = self.scr.getch()
 
-            # Если есть буфер команды — передаём клавишу в обработчик командной строки
-            # (кроме управляющих клавиш меню)
-            if hasattr(self,'_cmd_buf') and self._cmd_buf:
+            # ── Командная строка активна (есть буфер) ────────────────────────
+            if getattr(self, '_cmd_mode', False):
                 if self._handle_cmdline_key(k):
+                    if k == 27:  # Esc — выход из режима командной строки
+                        self._cmd_mode = False
                     continue
 
-            if k in (ord('q'),ord('Q')):
-                # Q только если командная строка пустая
-                if not getattr(self,'_cmd_buf',''):
-                    do_exit = True
-                    if self.proc and self.proc.poll() is None:
-                        ans = self.confirm("zapret2 запущен. Остановить при выходе?")
-                        if ans:
-                            self.stop_zapret()
-                    if self.ai_finder and not self._ai_done:
-                        if self.confirm("AI подбор идёт. Остановить?"):
-                            self.ai_finder.stop()
-                    break
-                else:
-                    self._handle_cmdline_key(k)
-            elif k==ord('1'): self.quick_start()
-            elif k==ord('2'): self.profiles_menu()
-            elif k==ord('3'): self.ai_strategy_menu()
-            elif k==ord('4'): self._mix_profiles_menu()
-            elif k==ord('5'): self.preview_cmd()
-            elif k==ord('6'): self.settings_menu()
-            elif k==ord('7'): self.run_blockcheck()
-            elif k==ord('8'): self.hostlist_editor()
-            elif k==ord('9'): self.show_dashboard()
-            elif k in (ord('w'),ord('W')): self.watchdog_menu()
-            elif k in (ord('a'),ord('A')): self.autostart_menu()
-            elif k in (ord('u'),ord('U')): self.autoupdate_menu()
-            elif k in (ord('l'),ord('L')): self.show_log()
-            elif k in (ord('s'),ord('S')):
+            # ── Навигация по главному меню стрелками ─────────────────────────
+            n_items = len(getattr(self, '_main_items', [15]))
+            if not hasattr(self, '_main_sel'): self._main_sel = 0
+
+            if k == curses.KEY_UP:
+                self._main_sel = max(0, self._main_sel - 1)
+                continue
+            elif k == curses.KEY_DOWN:
+                self._main_sel = min(n_items - 1, self._main_sel + 1)
+                continue
+            elif k == curses.KEY_HOME:
+                self._main_sel = 0; continue
+            elif k == curses.KEY_END:
+                self._main_sel = n_items - 1; continue
+            elif k in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT):
+                # Enter / → — выполнить выбранный пункт
+                if hasattr(self, '_main_items'):
+                    sel_key = self._main_items[self._main_sel][0]
+                    k = ord(sel_key)  # превращаем в символ и обрабатываем ниже
+
+            # ── Клавиша ~ — войти в командную строку ─────────────────────────
+            elif k == ord('`') or k == ord('~'):
+                self._cmd_mode = True
+                if not hasattr(self, '_cmd_buf'): self._cmd_buf = ''
+                continue
+
+            # ── Обычные клавиши меню ──────────────────────────────────────────
+            if k in (ord('q'), ord('Q')):
+                if self.proc and self.proc.poll() is None:
+                    ans = self.confirm("zapret2 запущен. Остановить при выходе?")
+                    if ans:
+                        self.stop_zapret()
+                if self.ai_finder and not self._ai_done:
+                    if self.confirm("AI подбор идёт. Остановить?"):
+                        self.ai_finder.stop()
+                break
+            elif k == ord('1'): self.quick_start()
+            elif k == ord('2'): self.profiles_menu()
+            elif k == ord('3'): self.ai_strategy_menu()
+            elif k == ord('4'): self._mix_profiles_menu()
+            elif k == ord('5'): self.preview_cmd()
+            elif k == ord('6'): self.settings_menu()
+            elif k == ord('7'): self.run_blockcheck()
+            elif k == ord('8'): self.hostlist_editor()
+            elif k == ord('9'): self.show_dashboard()
+            elif k in (ord('w'), ord('W')): self.watchdog_menu()
+            elif k in (ord('a'), ord('A')): self.autostart_menu()
+            elif k in (ord('u'), ord('U')): self.autoupdate_menu()
+            elif k in (ord('l'), ord('L')): self.show_log()
+            elif k in (ord('s'), ord('S')):
                 if self.proc and self.proc.poll() is None:
                     if self.confirm("Остановить zapret2?"): self.stop_zapret()
-                else: self.status_msg="Процесс не запущен"
-            elif k == ord('/'):
-                # / — активировать командную строку явно (как в vim)
-                if not hasattr(self,'_cmd_buf'): self._cmd_buf = ''
-            elif k in (curses.KEY_BACKSPACE, 127, 8, 27) and hasattr(self,'_cmd_buf'):
-                self._handle_cmdline_key(k)
-            elif 32 <= k < 256:
-                # Любой печатный символ не занятый меню — идёт в командную строку
-                menu_keys = set(b'123456789qQwWaAuUsSlL')
-                if k not in menu_keys:
-                    if not hasattr(self,'_cmd_buf'): self._cmd_buf = ''
-                    self._handle_cmdline_key(k)
+                else: self.status_msg = "Процесс не запущен"
 
         # Останавливаем фоновые сервисы TUI, но НЕ трогаем zapret-процесс
         # если он был запущен с start_new_session=True — он продолжит работать
