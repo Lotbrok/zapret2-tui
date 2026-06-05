@@ -407,7 +407,7 @@ class ZapretTUI:
             except Exception:
                 pass
 
-        self.add_log("[CFG] Бинарник не найден — укажите вручную в меню 6 → Настройки → Бинарник")
+        self.add_log("[CFG] Бинарник не найден — укажите вручную в меню 6  Настройки  Бинарник")
 
     def _on_new_profile(self, profile):
         self.cfg.setdefault("profiles", []).append(profile)
@@ -451,14 +451,14 @@ class ZapretTUI:
         h, w = self.scr.getmaxyx()
         running = self.proc and self.proc.poll() is None
         if running:
-            s = f" ▶ ЗАПУЩЕН PID={self.proc.pid}  {self.status_msg}"
+            s = f"  ЗАПУЩЕН PID={self.proc.pid}  {self.status_msg}"
             a = curses.color_pair(C_OK)|curses.A_BOLD
         elif self.ai_finder and not self._ai_done:
             msg, cur, tot = self.ai_progress
-            s = f" 🤖 AI: {msg[:50]}  [{cur}/{tot}]"
+            s = f" [AI] {msg[:50]}  [{cur}/{tot}]"
             a = curses.color_pair(C_AI)|curses.A_BOLD
         else:
-            s = f" ■ СТОП  {self.status_msg}"
+            s = f"  СТОП  {self.status_msg}"
             a = curses.color_pair(C_STATUS)
         try: self.scr.addstr(h-1, 0, s[:w-1].ljust(w-1), a)
         except curses.error: pass
@@ -611,7 +611,7 @@ class ZapretTUI:
         win=curses.newwin(bh,bw,2,2); win.bkgd(' ',curses.color_pair(C_MENU))
         scroll=max(0,len(self.log_lines)-(bh-2))
         while True:
-            win.clear(); self.border_box(win,"Лог  (↑↓  PgUp/PgDn  End  q=выход)")
+            win.clear(); self.border_box(win,"Лог  (  PgUp/PgDn  End  q=выход)")
             vis=bh-2
             for i in range(vis):
                 idx=scroll+i
@@ -619,7 +619,7 @@ class ZapretTUI:
                 ln=self.log_lines[idx][:bw-4]
                 if "[AI]" in ln: a=curses.color_pair(C_AI)
                 elif "ОШИБК" in ln.upper() or "ERROR" in ln.upper(): a=curses.color_pair(C_WARN)
-                elif "УСПЕХ" in ln or "✓" in ln: a=curses.color_pair(C_OK)
+                elif "УСПЕХ" in ln or "" in ln: a=curses.color_pair(C_OK)
                 else: a=curses.color_pair(C_DIM)
                 try: win.addstr(i+1,2,ln,a)
                 except curses.error: pass
@@ -696,7 +696,7 @@ class ZapretTUI:
     def _ai_found_cb(self, profile: dict):
         with self._ai_lock:
             self.ai_new_results.append(profile)
-        self.add_log(f"[AI] ✓ Найдена стратегия: {profile.get('name','?')[:50]}")
+        self.add_log(f"[AI] [OK] Найдена стратегия: {profile.get('name','?')[:50]}")
 
     def _ai_progress_cb(self, msg: str, cur: int, tot: int):
         self.ai_progress = (msg, cur, tot)
@@ -723,10 +723,10 @@ class ZapretTUI:
         if not has_key:
             # Предлагаем настроить провайдера
             choice = self.menu(
-                ["🤖 Настроить Claude (Anthropic)",
-                 "💬 Настроить ChatGPT (OpenAI)",
-                 "⚡ Продолжить без AI (только встроенные стратегии)",
-                 "← Назад"],
+                ["[C] Настроить Claude (Anthropic)",
+                 "[G] Настроить ChatGPT (OpenAI)",
+                 "[~] Продолжить без AI (только встроенные стратегии)",
+                 " Назад"],
                 "AI ключ не настроен", y_off=4, x_off=4
             )
             if choice == 3 or choice == -1:
@@ -752,10 +752,10 @@ class ZapretTUI:
         # Выбор: только поиск или + запуск тестов
         h, w = self.scr.getmaxyx()
         action = self.menu(
-            [f"🤖 Полный подбор: поиск + тест стратегий для {svc}",
-             "🔍 Только поиск решений в интернете (без тестов)",
-             "🎛  Миксовать существующие профили",
-             "← Назад"],
+            [f"[*] Полный подбор: поиск + тест стратегий для {svc}",
+             "[?] Только поиск решений в интернете (без тестов)",
+             "[+] Миксовать существующие профили",
+             " Назад"],
             "Режим AI подбора", y_off=4, x_off=4, width=min(w-8,65)
         )
 
@@ -793,111 +793,116 @@ class ZapretTUI:
         self._ai_wait_screen(domain, svc)
 
     def _ai_wait_screen(self, domain: str, svc: str):
-        """Интерактивный экран прогресса AI подбора."""
+        """Экран прогресса AI — без мигания (persistent window + noutrefresh/doupdate)."""
         h, w = self.scr.getmaxyx()
+        bh = h - 4; bw = w - 4
+
+        try:
+            self.scr.addnstr(0, 0,
+                f" AI Подбор: {svc} ({domain}) ".center(w), w-1,
+                curses.color_pair(C_TITLE) | curses.A_BOLD)
+        except curses.error: pass
+
+        win = curses.newwin(bh, bw, 2, 2)
+        win.bkgd(' ', curses.color_pair(C_MENU))
+        win.keypad(True)
+
         while True:
             self.poll_proc()
-            # Проверяем новые результаты
             with self._ai_lock:
                 new = list(self.ai_new_results)
 
-            # Рисуем экран
-            self.scr.clear()
-            self.draw_title()
-            bh=h-4; bw=w-4
-            win=curses.newwin(bh,bw,2,2); win.bkgd(' ',curses.color_pair(C_MENU))
-            self.border_box(win, f"AI Подбор: {svc} ({domain})")
+            win.erase()
+            self.border_box(win, f"AI: {svc} ({domain})")
 
-            # Статус
             msg, cur, tot = self.ai_progress
-            pct = int(cur*100/tot) if tot>0 else 0
-            bar_w = bw-20
-            filled = int(bar_w * pct / 100)
-            bar = "█"*filled + "░"*(bar_w-filled)
+            pct   = int(cur * 100 / tot) if tot > 0 else 0
+            bar_w = max(10, bw - 22)
+            bar   = "#" * int(bar_w * pct / 100) + "." * (bar_w - int(bar_w * pct / 100))
             try:
-                win.addstr(2, 3, f"Прогресс: {pct:3d}%  ", curses.color_pair(C_KEY)|curses.A_BOLD)
-                win.addstr(2, 18, f"[{bar}]", curses.color_pair(C_AI))
+                win.addstr(2, 3, f"{pct:3d}% ", curses.color_pair(C_KEY) | curses.A_BOLD)
+                win.addstr(2, 8, f"[{bar}]", curses.color_pair(C_AI))
                 win.addstr(3, 3, msg[:bw-6], curses.color_pair(C_DIM))
             except curses.error: pass
 
-            # Найденные стратегии
-            try: win.addstr(5, 3, "Найденные стратегии:", curses.color_pair(C_KEY)|curses.A_BOLD)
+            try: win.addstr(5, 3, "Найдено:", curses.color_pair(C_KEY) | curses.A_BOLD)
             except curses.error: pass
             if new:
-                for i, p in enumerate(new[:bh-14]):
+                for i, p in enumerate(new[:4]):
+                    tag  = "[M]" if "mixed" in p.get("source","") else "[+]"
                     name = p.get("name","?")[:bw-10]
-                    src  = p.get("source","?")
-                    icon = "⭐" if "mixed" not in src else "🔀"
-                    try: win.addstr(6+i, 3, f"{icon} {name}", curses.color_pair(C_OK))
+                    try: win.addstr(6+i, 3, f"{tag} {name}", curses.color_pair(C_OK))
                     except curses.error: pass
             else:
-                try: win.addstr(6, 3, "  (поиск идёт…)", curses.color_pair(C_DIM))
+                try: win.addstr(6, 3, "  (идёт поиск...)", curses.color_pair(C_DIM))
                 except curses.error: pass
 
-            # Последние строки лога
-            log_row = max(8, 6+len(new)+2)
+            log_row = max(11, 6 + min(len(new), 4) + 2)
             try: win.addstr(log_row, 3, "Лог:", curses.color_pair(C_KEY))
             except curses.error: pass
             log_vis = bh - log_row - 4
             for i, ln in enumerate(self.log_lines[-log_vis:]):
-                if log_row+1+i >= bh-2: break
-                if "[AI]" in ln: a=curses.color_pair(C_AI)
-                elif "✓" in ln:  a=curses.color_pair(C_OK)
-                elif "✗" in ln:  a=curses.color_pair(C_WARN)
-                else:            a=curses.color_pair(C_DIM)
+                if log_row + 1 + i >= bh - 2: break
+                if "[AI]" in ln:                           a = curses.color_pair(C_AI)
+                elif "[OK]" in ln or "УСПЕХ" in ln:        a = curses.color_pair(C_OK)
+                elif "[!!]" in ln or "ОШИБК" in ln.upper():a = curses.color_pair(C_WARN)
+                else:                                       a = curses.color_pair(C_DIM)
                 try: win.addstr(log_row+1+i, 3, ln[:bw-6], a)
                 except curses.error: pass
 
-            # Кнопки
-            try:
-                win.addstr(bh-2, 3,
-                           " S Стоп AI  L Лог  Enter Применить найденное  Esc Назад ",
-                           curses.color_pair(C_KEY))
-            except curses.error: pass
-
             if self._ai_done:
                 if self._ai_success and new:
-                    try: win.addstr(bh-3, 3, f"✓ УСПЕХ! Найдено {len(new)} стратегий. Enter = применить",
-                                    curses.color_pair(C_OK)|curses.A_BOLD)
+                    try: win.addstr(bh-3, 3,
+                        f"[OK] Найдено {len(new)} стратегий.  Enter = применить  Esc = назад",
+                        curses.color_pair(C_OK) | curses.A_BOLD)
                     except curses.error: pass
                 else:
-                    try: win.addstr(bh-3, 3, "✗ Рабочая стратегия не найдена. Esc = назад",
-                                    curses.color_pair(C_WARN)|curses.A_BOLD)
+                    try: win.addstr(bh-3, 3,
+                        "[!!] Стратегия не найдена.  Esc = назад",
+                        curses.color_pair(C_WARN) | curses.A_BOLD)
                     except curses.error: pass
+            try:
+                win.addstr(bh-1, 2,
+                    " S=стоп  L=лог  Enter=применить  Esc=назад ",
+                    curses.color_pair(C_KEY))
+            except curses.error: pass
 
-            win.refresh()
-            self.draw_statusbar()
-            self.scr.refresh()
+            win.noutrefresh()
+            curses.doupdate()
 
-            self.scr.timeout(400)
-            k = self.scr.getch()
+            win.timeout(500)
+            k = win.getch()
 
             if k in (27, ord('q')) and self._ai_done:
-                del win; self.scr.touchwin(); self.scr.refresh(); return
+                break
             elif k == 27 and not self._ai_done:
-                if self.confirm("AI подбор ещё идёт. Остановить?"):
+                if self.confirm("AI подбор идёт. Остановить?"):
                     self.ai_finder.stop()
-                    del win; self.scr.touchwin(); self.scr.refresh(); return
-            elif k in (10, 13) and new:
+                    break
+            elif k in (10, 13, curses.KEY_ENTER) and new:
                 del win; self.scr.touchwin(); self.scr.refresh()
                 self._apply_ai_results(new)
                 return
             elif k in (ord('s'), ord('S')):
                 if self.ai_finder and not self._ai_done:
-                    self.ai_finder.stop(); self._ai_done=True
+                    self.ai_finder.stop(); self._ai_done = True
             elif k in (ord('l'), ord('L')):
                 del win; self.scr.touchwin(); self.scr.refresh()
-                self.show_log(); return
-            del win
+                self.show_log()
+                return
+
+        del win
+        self.scr.touchwin()
+        self.scr.refresh()
 
     def _apply_ai_results(self, results: List[dict]):
         """Предлагает применить/запустить найденные AI стратегии."""
         if not results:
             self.msgbox("Нет результатов для применения."); return
 
-        items = [f"{'🔀' if p.get('source')=='mixed' else '⭐'} {p.get('name','?')[:55]}"
+        items = [f"{'' if p.get('source')=='mixed' else ''} {p.get('name','?')[:55]}"
                  for p in results]
-        items += ["← Назад"]
+        items += [" Назад"]
         h, w = self.scr.getmaxyx()
         idx = self.menu(items, "Выберите стратегию",
                         y_off=3, x_off=3,
@@ -907,11 +912,11 @@ class ZapretTUI:
             return
 
         profile = results[idx]
-        actions = ["▶ Запустить сейчас",
-                   "▶ Запустить с --debug",
-                   "💾 Сохранить в профили",
-                   "🎛  Смешать с другим профилем",
-                   "← Назад"]
+        actions = ["[>] Запустить сейчас",
+                   "[D] Запустить с --debug",
+                   "[S] Сохранить в профили",
+                   "[+] Смешать с другим профилем",
+                   " Назад"]
         act = self.menu(actions, profile.get("name","?")[:40], y_off=5, x_off=5)
         if act == 0:
             self.start_zapret(profile)
@@ -931,7 +936,7 @@ class ZapretTUI:
         provider = get_active_provider(self.cfg)
         has_key  = bool(get_api_key(provider, self.cfg))
         if not has_key:
-            self.msgbox("Для поиска нужен API ключ.\n6 → Настройки → AI провайдер", "Нет ключа")
+            self.msgbox("Для поиска нужен API ключ.\n6  Настройки  AI провайдер", "Нет ключа")
             return
 
         self.add_log(f"[AI] Поиск решений для {domain}…")
@@ -1032,7 +1037,7 @@ class ZapretTUI:
             self.cfg.setdefault("profiles",[]).append(mixed)
             save_config(self.cfg)
             self.add_log(f"Создан микс: {name}")
-            actions = ["▶ Запустить сейчас", "💾 Только сохранить", "← Отмена"]
+            actions = ["[>] Запустить сейчас", "[S] Только сохранить", " Отмена"]
             act = self.menu(actions, "Готово!", y_off=5, x_off=5)
             if act==0: self.start_zapret(mixed)
 
@@ -1044,9 +1049,9 @@ class ZapretTUI:
             for p in profiles:
                 mp = "⊞" if p.get("multiprofile") else " "
                 src = p.get("source","")
-                icon = "🤖" if "ai" in src.lower() or "web" in src.lower() else ("🔀" if "mixed" in src else "▸")
+                icon = "[A]" if "ai" in src.lower() or "web" in src.lower() else ("[M]" if "mixed" in src else "[>]")
                 items.append(f"{icon}{mp} {p.get('name','?')[:50]}")
-            items += ["  + Новый профиль", "← Назад"]
+            items += ["  + Новый профиль", " Назад"]
             h,w=self.scr.getmaxyx()
             idx=self.menu(items,"Профили",y_off=2,x_off=2,
                           height=min(len(items)+2,h-4),width=min(w-4,70))
@@ -1056,9 +1061,9 @@ class ZapretTUI:
                 if p: self.cfg["profiles"].append(p); save_config(self.cfg)
             elif idx<len(profiles):
                 p=profiles[idx]
-                acts=["▶ Запустить","▶ Запустить с --debug",
-                      "✏  Редактировать","🔀 Смешать с другим",
-                      "⧉  Дублировать","✗  Удалить","← Назад"]
+                acts=["[>] Запустить","[D] Запустить с --debug",
+                      "  Редактировать","[+] Смешать с другим",
+                      "[C] Дублировать","  Удалить"," Назад"]
                 act=self.menu(acts,p.get("name","")[:40],y_off=4,x_off=4)
                 if act==0: self.start_zapret(p)
                 elif act==1: self.start_zapret(p,debug=True)
@@ -1129,7 +1134,7 @@ class ZapretTUI:
         lst=list(lst)
         while True:
             items=[f"[{i+1}] {d}" for i,d in enumerate(lst)]
-            items+=["  + Добавить","  ✓ Готово"]
+            items+=["  [+] Добавить","  [OK] Готово"]
             h,w=self.scr.getmaxyx()
             idx=self.menu(items,"lua-desync стратегии",y_off=4,x_off=4,
                           height=min(len(items)+2,h-8),width=min(w-8,72))
@@ -1138,7 +1143,7 @@ class ZapretTUI:
                 v=self.inputbox("Аргумент lua-desync:","fake:blob=fake_default_tls:tcp_md5")
                 if v: lst.append(v)
             elif idx<len(lst):
-                acts=["Редактировать","Удалить","↑ Вверх","↓ Вниз"]
+                acts=["Редактировать","Удалить"," Вверх"," Вниз"]
                 act=self.menu(acts,lst[idx][:30],y_off=6,x_off=6)
                 if act==0:
                     v=self.inputbox("Аргумент:",lst[idx])
@@ -1192,9 +1197,9 @@ class ZapretTUI:
             self.scr.refresh()
             ok, detail = test_api_key(provider, self.cfg)
             if ok:
-                self.msgbox(f"✓ {detail}\n\nПровайдер: {info['name']}\nКлюч: {mask_key(key)}", "Успех")
+                self.msgbox(f" {detail}\n\nПровайдер: {info['name']}\nКлюч: {mask_key(key)}", "Успех")
             else:
-                self.msgbox(f"✗ Ошибка: {detail}\n\nПроверьте ключ и повторите.", "Ошибка")
+                self.msgbox(f" Ошибка: {detail}\n\nПроверьте ключ и повторите.", "Ошибка")
 
     def _select_ai_provider(self):
         """Выбор активного AI провайдера."""
@@ -1202,10 +1207,10 @@ class ZapretTUI:
         items = []
         for pid, info in AI_PROVIDERS.items():
             key = get_api_key(pid, self.cfg)
-            status = f"✓ {mask_key(key)}" if key else "✗ ключ не задан"
-            mark = "► " if pid == current else "  "
+            status = f"[key] {mask_key(key)}" if key else "[--] не задан"
+            mark = " " if pid == current else "  "
             items.append(f"{mark}{info['name']}  [{status}]")
-        items.append("← Назад")
+        items.append(" Назад")
 
         h, w = self.scr.getmaxyx()
         idx = self.menu(items, "Выбор AI провайдера",
@@ -1244,12 +1249,12 @@ class ZapretTUI:
                 val = mask_key(key) if key else "(не задан)"
                 items.append(f"  {info['name']:<26} {val}")
 
-            items += ["  🔍 Найти бинарник автоматически",
+            items += ["  [F] Найти бинарник автоматически",
                       "  Проверить бинарник",
                       "  Проверить безопасность .env",
-                      "← Назад"]
+                      " Назад"]
             h, w = self.scr.getmaxyx()
-            idx = self.menu(items, "Настройки — ↑↓ выбор  Enter подтвердить  Esc назад")
+            idx = self.menu(items, "Настройки —  выбор  Enter подтвердить  Esc назад")
             total = len(zap_fields) + 1 + len(AI_PROVIDERS)
             if idx == -1 or idx == len(items)-1:
                 save_config(self.cfg); break
@@ -1259,7 +1264,7 @@ class ZapretTUI:
                 if warns:
                     self.msgbox("\n".join(warns), "Предупреждения безопасности")
                 else:
-                    self.msgbox("✓ .env файл защищён\n✓ .gitignore настроен", "Безопасность OK")
+                    self.msgbox("OK: .env защищён, .gitignore настроен", "Безопасность OK")
             elif idx == len(items)-3:
                 # Проверить бинарник
                 b = find_binary(self.cfg)
@@ -1271,7 +1276,7 @@ class ZapretTUI:
                 new_b = self.cfg.get("binary","")
                 found = find_binary(self.cfg)
                 if found:
-                    self.msgbox(f"✓ Найден:\n{found}\n\nСохранено в конфиг.", "Автопоиск")
+                    self.msgbox(f"Найден:\n{found}\n\nСохранено в конфиг.", "Автопоиск")
                 else:
                     self.msgbox(
                         f"Не найден автоматически.\n\n"
@@ -1351,7 +1356,7 @@ class ZapretTUI:
         # ── Меню ─────────────────────────────────────────────────────────────
         mw.erase()
         mw.bkgd(' ', curses.color_pair(C_MENU))
-        self.border_box(mw, "Меню  ↑↓ выбор  Enter запустить")
+        self.border_box(mw, "Меню   выбор  Enter запустить")
         self._main_items = [("1","Быстрый старт"), ("2","Мои профили"),
                  ("3","AI подбор стратегии"), ("4","Смешать профили"),
                  ("5","Предпросмотр команды"), ("6","Настройки"),
@@ -1380,7 +1385,7 @@ class ZapretTUI:
         self.border_box(iw, "Статус")
 
         running = self.proc and self.proc.poll() is None
-        stxt = "▶ ЗАПУЩЕН" if running else "■ СТОП"
+        stxt = "[>>] ЗАПУЩЕН" if running else "[==] СТОП"
         sa = (curses.color_pair(C_OK) | curses.A_BOLD) if running else curses.color_pair(C_WARN)
         try:
             iw.addstr(2, 3, "Статус: ", curses.color_pair(C_KEY))
@@ -1435,8 +1440,8 @@ class ZapretTUI:
         for i, ln in enumerate(self.log_lines[-(ph - 17):]):
             if 15 + i >= ph - 1: break
             if "[AI]" in ln:              a = curses.color_pair(C_AI)
-            elif "✓" in ln:              a = curses.color_pair(C_OK)
-            elif "✗" in ln or "ОШИБК" in ln.upper(): a = curses.color_pair(C_WARN)
+            elif "[OK]" in ln or "УСПЕХ" in ln:              a = curses.color_pair(C_OK)
+            elif "[!!]" in ln or "" in ln or "ОШИБК" in ln.upper(): a = curses.color_pair(C_WARN)
             else:                         a = curses.color_pair(C_DIM)
             try: iw.addstr(15 + i, 3, ln[:iw_w - 5], a)
             except curses.error: pass
@@ -1461,12 +1466,12 @@ class ZapretTUI:
             h, w = self.scr.getmaxyx()
             items = []
             for f in files:
-                icon = "📋" if f["source"] == "zapret2" else "✏ "
+                icon = "[z]" if f["source"] == "zapret2" else "[u]"
                 items.append(f"{icon} {f['name']:<30} {f['count']:>4} доменов  [{f['source']}]")
             items += ["  + Создать новый хостлист",
-                      "  📥 Импорт из URL",
-                      "  🔍 Мониторинг-лист (домены для дашборда)",
-                      "← Назад"]
+                      "  [I] Импорт из URL",
+                      "  [M] Мониторинг-лист (домены для дашборда)",
+                      " Назад"]
             idx = self.menu(items, "Редактор хостлистов",
                             y_off=2, x_off=2,
                             height=min(len(items)+2, h-4),
@@ -1496,8 +1501,8 @@ class ZapretTUI:
             if not items:
                 items = ["  (файл пуст)"]
             if not is_zap:
-                items += ["  + Добавить домен", "  🗑  Очистить всё"]
-            items += ["  📊 Использовать в мониторинге", "← Назад"]
+                items += ["  + Добавить домен", "  [X] Очистить всё"]
+            items += ["   Использовать в мониторинге", " Назад"]
 
             idx = self.menu(items, title,
                             y_off=2, x_off=2,
@@ -1513,7 +1518,7 @@ class ZapretTUI:
                 if d:
                     d = d.strip().lower()
                     self.hlm.add_domain(path, d)
-                    self.add_log(f"[HL] Добавлен: {d} → {finfo['name']}")
+                    self.add_log(f"[HL] Добавлен: {d}  {finfo['name']}")
             elif not is_zap and idx == offset+1:
                 # Очистить
                 if self.confirm(f"Очистить {finfo['name']}? ({len(domains)} доменов)"):
@@ -1525,9 +1530,9 @@ class ZapretTUI:
                 # Редактировать/удалить домен
                 domain = domains[idx]
                 act = self.menu(
-                    [f"✏  Редактировать: {domain}",
-                     f"🗑  Удалить: {domain}",
-                     "← Назад"],
+                    [f"  Редактировать: {domain}",
+                     f"  Удалить: {domain}",
+                     " Назад"],
                     "Действие", y_off=5, x_off=5)
                 if act == 0:
                     nd = self.inputbox("Домен:", domain)
@@ -1657,7 +1662,7 @@ class ZapretTUI:
         h, w = self.scr.getmaxyx()
 
         # Заголовок
-        title = " 📊 МОНИТОРИНГ ДОСТУПНОСТИ "
+        title = "  МОНИТОРИНГ ДОСТУПНОСТИ "
         try:
             self.scr.addstr(0, 0,
                             title.center(w),
@@ -1676,10 +1681,10 @@ class ZapretTUI:
                 f" Всего: {total}  ",
                 curses.color_pair(C_DIM))
             self.scr.addstr(1, 14,
-                f"✓ Доступно: {ok_c}  ",
+                f" Доступно: {ok_c}  ",
                 curses.color_pair(C_OK)|curses.A_BOLD)
             self.scr.addstr(1, 32,
-                f"✗ Недоступно: {fail_c}  ",
+                f" Недоступно: {fail_c}  ",
                 curses.color_pair(C_WARN)|curses.A_BOLD)
             self.scr.addstr(1, 52,
                 f"? Проверяется: {unk_c}",
@@ -1706,15 +1711,15 @@ class ZapretTUI:
 
             # Цвет и статус
             if s.ok is True:
-                status_str = "● ДОСТУПЕН"
+                status_str = "[OK] ДОСТУПЕН"
                 status_attr = curses.color_pair(C_OK)|curses.A_BOLD
                 row_attr   = curses.color_pair(C_OK)
             elif s.ok is False:
-                status_str = "✗ БЛОКИРОВАН"
+                status_str = "[!!] БЛОКИРОВАН"
                 status_attr = curses.color_pair(C_WARN)|curses.A_BOLD
                 row_attr   = curses.color_pair(C_WARN)
             else:
-                status_str = "○ проверка…"
+                status_str = "[..] проверка"
                 status_attr = curses.color_pair(C_DIM)
                 row_attr   = curses.color_pair(C_DIM)
 
@@ -1745,7 +1750,7 @@ class ZapretTUI:
                 for j, h_ok in enumerate(s.history[-10:]):
                     c = curses.color_pair(C_OK) if h_ok else curses.color_pair(C_WARN)
                     try:
-                        self.scr.addstr(row, 68+j, "▓" if h_ok else "░", c)
+                        self.scr.addstr(row, 68+j, "#" if h_ok else ".", c)
                     except curses.error: pass
                 # Время проверки
                 self.scr.addstr(row, 80, f" {age_str}", curses.color_pair(C_DIM))
@@ -1757,7 +1762,7 @@ class ZapretTUI:
         try:
             self.scr.addstr(hint_row, 0, "─"*min(w-1, col_w), curses.color_pair(C_BORDER))
             self.scr.addstr(hint_row+1, 1,
-                " R перепроверить  A добавить  E редактировать  ↑↓ прокрутка  Q выход ",
+                " R перепроверить  A добавить  E редактировать   прокрутка  Q выход ",
                 curses.color_pair(C_KEY))
             # Интервал обновления
             interval = self.feat.get("monitor_interval", 30)
@@ -1781,7 +1786,7 @@ class ZapretTUI:
             domains  = self.feat.get("watchdog_domains", [])
             wd_run   = self.watchdog._thread and self.watchdog._thread.is_alive()
 
-            status_str = ("▶ АКТИВЕН" if wd_run else "■ ОСТАНОВЛЕН")
+            status_str = (" АКТИВЕН" if wd_run else " ОСТАНОВЛЕН")
             status_col = C_OK if wd_run else C_WARN
 
             h, w = self.scr.getmaxyx()
@@ -1791,7 +1796,7 @@ class ZapretTUI:
                 f"   Провалов до смены:   {thresh}",
                 f"   Домены для WD:       {len(domains)} ({', '.join(domains[:2])}{'…' if len(domains)>2 else ''})",
                 "   Использовать домены из мониторинга",
-                "← Назад",
+                " Назад",
             ]
             idx = self.menu(items, "Watchdog — автопереключение",
                             y_off=3, x_off=3,
@@ -1855,7 +1860,7 @@ class ZapretTUI:
                 "   Установить/обновить юнит",
                 "   Показать unit файл",
                 "   Удалить автозапуск",
-                "← Назад",
+                " Назад",
             ]
             idx = self.menu(items, "Автозапуск (systemd)",
                             y_off=3, x_off=3,
@@ -1917,7 +1922,7 @@ class ZapretTUI:
                 f"   Интервал:     каждые {interval} дн.",
                 f"   Следующий:    {next_run}",
                 "   Запустить обновление сейчас",
-                "← Назад",
+                " Назад",
             ]
             idx = self.menu(items, "Автообновление стратегий",
                             y_off=3, x_off=3,
@@ -1965,14 +1970,14 @@ class ZapretTUI:
         else:
             # Статусная строка с подсказкой
             if running:
-                status = f"▶ ЗАПУЩЕН  PID={self.proc.pid}  {self.status_msg}"
+                status = f"[>>] ЗАПУЩЕН  PID={self.proc.pid}  {self.status_msg}"
                 attr   = curses.color_pair(C_OK) | curses.A_BOLD
             elif self.ai_finder and not self._ai_done:
                 msg, cur, tot = self.ai_progress
                 status = f"AI: {msg[:40]}  [{cur}/{tot}]"
                 attr   = curses.color_pair(C_AI) | curses.A_BOLD
             else:
-                status = f"■ СТОП  {self.status_msg}"
+                status = f"[==] СТОП  {self.status_msg}"
                 attr   = curses.color_pair(C_STATUS)
             hint = "  [~ = команда]"
             line = f" {status}"
